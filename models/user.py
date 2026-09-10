@@ -44,6 +44,11 @@ class User(Base):
         "Agent",
         back_populates="owner",
     )
+    conversations = relationship(
+    "Conversation",
+    back_populates="user",
+    cascade="all, delete-orphan",
+)
 
 class RefreshToken(Base):
     """
