@@ -1,5 +1,5 @@
 """
-Phase 5C -- Conversation and Message API schemas.
+Phase 5C / 5D -- Conversation and Message API schemas.
 """
 
 from datetime import datetime
@@ -9,17 +9,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 # ============================================================
-# Conversation schemas
+# Conversations
 # ============================================================
 
 class ConversationCreate(BaseModel):
-    """
-    Request body for creating a conversation.
-
-    Title is optional because the frontend may initially create
-    an untitled conversation and assign a title later.
-    """
-
     title: Optional[str] = Field(
         default=None,
         max_length=255,
@@ -27,50 +20,32 @@ class ConversationCreate(BaseModel):
 
 
 class ConversationResponse(BaseModel):
-    """
-    Conversation returned by the API.
-    """
-
     id: str
     user_id: int
     title: Optional[str]
     created_at: datetime
     updated_at: datetime
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True
+    )
 
 
 class ConversationListResponse(BaseModel):
-    """
-    Response wrapper for conversation listing.
-    """
-
     conversations: List[ConversationResponse]
 
 
 # ============================================================
-# Message schemas
+# Messages
 # ============================================================
 
 class MessageCreate(BaseModel):
-    """
-    Request body for adding a message to a conversation.
-
-    The client can only create normal user messages through
-    this endpoint. Assistant/system/tool messages are created
-    internally by the backend when orchestration is connected.
-    """
-
     content: str = Field(
-        min_length=1,
+        min_length=1
     )
 
 
 class MessageResponse(BaseModel):
-    """
-    Message returned by the API.
-    """
-
     id: str
     conversation_id: str
     role: str
@@ -78,12 +53,34 @@ class MessageResponse(BaseModel):
     message_metadata: Optional[Dict[str, Any]] = None
     created_at: datetime
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True
+    )
 
 
 class MessageListResponse(BaseModel):
-    """
-    Response wrapper for conversation messages.
-    """
-
     messages: List[MessageResponse]
+
+
+# ============================================================
+# Phase 5D -- Chat
+# ============================================================
+
+class ChatRequest(BaseModel):
+    content: str = Field(
+        min_length=1
+    )
+
+
+class ChatResponse(BaseModel):
+    conversation_id: str
+
+    user_message: MessageResponse
+
+    assistant_message: Optional[MessageResponse] = None
+
+    execution_id: Optional[str] = None
+
+    status: str
+
+    error: Optional[str] = None

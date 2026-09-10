@@ -1,13 +1,16 @@
+
 """
 Phase 5A -- centralized auth utilities.
 
 Everything token/password-related lives here so there is exactly one
-place that knows how a password is hashed or a JWT is signed. Reuses
-the project's existing settings.SECRET_KEY / settings.ALGORITHM /
-settings.ACCESS_TOKEN_EXPIRE_MINUTES (already present in core/config.py
-from an earlier, since-removed auth attempt) rather than introducing a
-second, differently-named set of JWT settings.
+place that knows how a password is hashed or a JWT is signed.
+
+Access tokens are JWTs.
+
+Refresh tokens are opaque, high-entropy values. Only their SHA-256
+hash should be persisted by the authentication service.
 """
+
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -23,127 +26,240 @@ from core.config import settings
 from core.database import get_db
 from models.user import User
 
-# tokenUrl is only used by Swagger's "Authorize" button to know which
-# endpoint issues tokens -- it does not change how this dependency
-# validates a token that's already been supplied.
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# ---------------------------------------------------------------------------
+# OAuth2 / Swagger
+# ---------------------------------------------------------------------------
+#
+# Swagger's Authorize button sends username/password to this endpoint.
+# The normal application login endpoint remains /api/auth/login and
+# continues accepting the JSON LoginRequest body.
+#
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl="/api/auth/login/oauth2",
+    auto_error=False,
+)
+
+
+# ---------------------------------------------------------------------------
+# Password hashing
+# ---------------------------------------------------------------------------
+
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto",
+)
+
+
+# ---------------------------------------------------------------------------
+# Token constants
+# ---------------------------------------------------------------------------
 
 ACCESS_TOKEN_TYPE = "access"
 
 
-# --- Password hashing --------------------------------------------------
+# ---------------------------------------------------------------------------
+# Password hashing utilities
+# ---------------------------------------------------------------------------
 
 def hash_password(password: str) -> str:
+    """
+    Hash a plaintext password using bcrypt.
+    """
     return pwd_context.hash(password)
 
 
-def verify_password(plain_password: str, password_hash: str) -> bool:
-    return pwd_context.verify(plain_password, password_hash)
+def verify_password(
+    plain_password: str,
+    password_hash: str,
+) -> bool:
+    """
+    Verify a plaintext password against its bcrypt hash.
+    """
+    return pwd_context.verify(
+        plain_password,
+        password_hash,
+    )
 
 
-# --- JWT access tokens ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# JWT access tokens
+# ---------------------------------------------------------------------------
 
 def create_access_token(user_id: int) -> str:
+    """
+    Create a signed JWT access token for a platform user.
+    """
+
     now = datetime.now(timezone.utc)
-    expire = now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    expire = now + timedelta(
+        minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+
     payload = {
         "sub": str(user_id),
         "iat": now,
         "exp": expire,
         "type": ACCESS_TOKEN_TYPE,
     }
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+    return jwt.encode(
+        payload,
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
 
 
 class InvalidTokenError(Exception):
+    """
+    Raised when an access token is invalid, expired, malformed,
+    or is not an access token.
+    """
+
     pass
 
 
 def decode_access_token(token: str) -> dict:
-    """Raises InvalidTokenError for anything wrong with the token
-    (bad signature, expired, wrong type, malformed) -- callers don't
-    need to distinguish why, they all map to the same 401."""
+    """
+    Decode and validate a JWT access token.
+
+    Raises:
+        InvalidTokenError: when the token is invalid, expired,
+        malformed, or has the wrong token type.
+    """
+
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+        )
+
     except JWTError:
-        raise InvalidTokenError("Invalid or expired token")
+        raise InvalidTokenError(
+            "Invalid or expired token"
+        )
 
     if payload.get("type") != ACCESS_TOKEN_TYPE:
-        raise InvalidTokenError("Wrong token type")
+        raise InvalidTokenError(
+            "Wrong token type"
+        )
 
     return payload
 
 
-# --- Refresh tokens (opaque, DB-backed -- see models/user.py) ----------
+# ---------------------------------------------------------------------------
+# Opaque refresh tokens
+# ---------------------------------------------------------------------------
 
 def generate_refresh_token_value() -> str:
-    """High-entropy random string handed to the client. Only its hash
-    is ever stored (see hash_refresh_token) -- this raw value exists
-    only in the response body and the client's storage, never in the DB
-    or in logs."""
+    """
+    Generate a high-entropy refresh token.
+
+    The raw token is returned to the client but should never be
+    persisted in the database or written to logs.
+    """
+
     return secrets.token_urlsafe(48)
 
 
 def hash_refresh_token(raw_token: str) -> str:
-    """SHA-256 is appropriate here (unlike for passwords): this input
-    is already a 48-byte random value, not a human-guessable password,
-    so a fast hash is fine and lets /refresh look it up by exact match
-    instead of checking it against every stored hash."""
-    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    """
+    Hash a refresh token using SHA-256.
+
+    Refresh tokens are already cryptographically random, so a fast
+    deterministic hash is appropriate for database lookup.
+    """
+
+    return hashlib.sha256(
+        raw_token.encode("utf-8")
+    ).hexdigest()
 
 
-# --- get_current_user dependency ----------------------------------------
+# ---------------------------------------------------------------------------
+# Authentication errors
+# ---------------------------------------------------------------------------
 
 def _unauthorized(detail: str) -> HTTPException:
+    """
+    Build a standard HTTP 401 response.
+    """
+
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail=detail,
-        headers={"WWW-Authenticate": "Bearer"},
+        headers={
+            "WWW-Authenticate": "Bearer",
+        },
     )
 
+
+# ---------------------------------------------------------------------------
+# Current-user dependency
+# ---------------------------------------------------------------------------
 
 def get_current_user(
     token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
 ) -> User:
     """
-    Reusable dependency for any protected endpoint:
+    Resolve the currently authenticated platform user.
 
-        @router.get("/something")
-        def something(current_user: User = Depends(get_current_user)):
-            ...
+    Validation order:
 
-    Order of checks, matching the Phase 5A spec exactly:
-    1. Authorization header present
-    2. Bearer token well-formed / JWT valid
-    3. Not expired (decode_access_token raises on this)
-    4. User referenced by `sub` still exists
-    5. User is still active
+    1. Authorization header / bearer token exists.
+    2. JWT is valid.
+    3. JWT is not expired.
+    4. JWT contains a valid user ID.
+    5. User exists in the database.
+    6. User is active.
     """
+
     if token is None:
-        raise _unauthorized("Not authenticated")
+        raise _unauthorized(
+            "Not authenticated"
+        )
 
     try:
-        payload = decode_access_token(token)
+        payload = decode_access_token(
+            token
+        )
+
     except InvalidTokenError:
-        raise _unauthorized("Invalid or expired token")
+        raise _unauthorized(
+            "Invalid or expired token"
+        )
 
     user_id_raw = payload.get("sub")
+
     if user_id_raw is None:
-        raise _unauthorized("Invalid token payload")
+        raise _unauthorized(
+            "Invalid token payload"
+        )
 
     try:
         user_id = int(user_id_raw)
-    except (TypeError, ValueError):
-        raise _unauthorized("Invalid token payload")
 
-    user = db.query(User).filter(User.id == user_id).first()
+    except (TypeError, ValueError):
+        raise _unauthorized(
+            "Invalid token payload"
+        )
+
+    user = (
+        db.query(User)
+        .filter(User.id == user_id)
+        .first()
+    )
+
     if user is None:
-        raise _unauthorized("User not found")
+        raise _unauthorized(
+            "User not found"
+        )
 
     if not user.is_active:
-        raise _unauthorized("Inactive user")
+        raise _unauthorized(
+            "Inactive user"
+        )
 
     return user

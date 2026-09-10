@@ -10,6 +10,7 @@ A user can only access conversations where:
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
+from datetime import datetime, timezone
 
 from models.conversation import Conversation
 from models.message import Message, MessageRole
@@ -151,3 +152,21 @@ def list_messages(
         .order_by(Message.created_at.asc())
         .all()
     )
+def touch_conversation(
+    db: Session,
+    conversation_id: str,
+    user_id: int,
+) -> Conversation:
+    conversation = get_conversation(
+        db=db,
+        conversation_id=conversation_id,
+        user_id=user_id,
+    )
+
+    conversation.updated_at = datetime.now(timezone.utc)
+
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+
+    return conversation

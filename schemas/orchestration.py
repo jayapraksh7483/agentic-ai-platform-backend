@@ -1,13 +1,24 @@
+
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from models.orchestration import OrchestrationStatus, StepStatus
 
 
+# ============================================================
+# ORCHESTRATION REQUEST
+# ============================================================
+
 class OrchestrateRequest(BaseModel):
     user_input: str
+
+    # Optional conversation association.
+    #
+    # Direct /api/orchestrate calls can omit this.
+    # Conversation chat calls will provide it.
+    conversation_id: Optional[str] = None
 
     @field_validator("user_input")
     @classmethod
@@ -17,12 +28,20 @@ class OrchestrateRequest(BaseModel):
         return v
 
 
+# ============================================================
+# ORCHESTRATION RESPONSE
+# ============================================================
+
 class OrchestrateResponse(BaseModel):
     execution_id: str
     status: str
     result: Optional[str] = None
     error: Optional[str] = None
 
+
+# ============================================================
+# ORCHESTRATION STEP
+# ============================================================
 
 class StepOut(BaseModel):
     step_key: str
@@ -34,26 +53,54 @@ class StepOut(BaseModel):
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True
+    )
 
+
+# ============================================================
+# ORCHESTRATION EXECUTION STATUS
+# ============================================================
 
 class ExecutionStatusResponse(BaseModel):
-    execution_id: str
+    # SQLAlchemy model uses `id`.
+    # Public API exposes it as `execution_id`.
+    execution_id: str = Field(
+        validation_alias="id",
+        serialization_alias="execution_id",
+    )
+
     status: OrchestrationStatus
     user_input: str
+
     required_capabilities: Optional[List[str]] = None
     current_step: Optional[str] = None
-    completed_steps: List[str] = []
-    steps: List[StepOut] = []
+
+    completed_steps: List[str] = Field(
+        default_factory=list
+    )
+
+    steps: List[StepOut] = Field(
+        default_factory=list
+    )
+
     final_response: Optional[str] = None
     error: Optional[str] = None
+
     start_time: datetime
     end_time: Optional[datetime] = None
     latency_ms: Optional[float] = None
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True
+    )
 
+
+# ============================================================
+# APPROVAL REQUEST
+# ============================================================
 
 class ApprovalRequest(BaseModel):
     approved: bool
     reason: Optional[str] = None
+

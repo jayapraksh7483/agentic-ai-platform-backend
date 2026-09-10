@@ -1,17 +1,13 @@
-"""
-Phase 5C -- Persistent Conversations.
-
-Each conversation belongs to exactly one authenticated user.
-
-Ownership rule:
-    users -> conversations
-
-A user can only read, modify, or delete their own conversations.
-"""
-
 import uuid
 
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Text
+from sqlalchemy import (
+    Column,
+    String,
+    Integer,
+    DateTime,
+    ForeignKey,
+    Text,
+)
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -56,14 +52,29 @@ class Conversation(Base):
         nullable=False,
     )
 
+    # ---------------------------------------------------------
+    # User relationship
+    # ---------------------------------------------------------
     user = relationship(
         "User",
         back_populates="conversations",
     )
 
+    # ---------------------------------------------------------
+    # Messages belonging to this conversation
+    # ---------------------------------------------------------
     messages = relationship(
         "Message",
         back_populates="conversation",
         cascade="all, delete-orphan",
         order_by="Message.created_at",
+    )
+
+    # ---------------------------------------------------------
+    # Orchestration executions belonging to this conversation
+    # ---------------------------------------------------------
+    orchestration_executions = relationship(
+        "OrchestrationExecution",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
     )

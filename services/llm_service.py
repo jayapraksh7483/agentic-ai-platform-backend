@@ -85,7 +85,10 @@ def build_tool_spec(
 
     if (
         input_schema.get("type") == "object"
-        and isinstance(input_schema.get("properties"), dict)
+        and isinstance(
+            input_schema.get("properties"),
+            dict,
+        )
     ):
         parameters = input_schema
 
@@ -141,7 +144,16 @@ class LLMClient(abc.ABC):
         user_input: str,
         model_name: str,
         temperature: Optional[float] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
+        """
+        Generate a normal LLM response.
+
+        `messages` is optional so existing callers remain compatible.
+
+        When supplied, messages contains the persistent conversation
+        history plus the current user message.
+        """
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -174,6 +186,38 @@ class LLMClient(abc.ABC):
 # =====================================================================
 # GEMINI
 # =====================================================================
+
+def _safe_gemini_text(response) -> str:
+    """
+    Safely extract text from a Gemini response.
+
+    response.text (the SDK property) internally iterates
+    `candidate.content.parts` with no None-guard. When Gemini returns a
+    response with no candidates, or a candidate with no content/parts
+    (e.g. blocked by safety settings, hit MAX_TOKENS with only a partial/
+    empty completion, or a function-call-only turn), that property
+    raises "'NoneType' object is not iterable" instead of just meaning
+    "no text". This unwraps the same structure defensively and returns
+    "" for any of those cases instead of crashing the whole request.
+    """
+    try:
+        candidates = getattr(response, "candidates", None)
+        if not candidates:
+            return ""
+
+        content = getattr(candidates[0], "content", None)
+        parts = getattr(content, "parts", None) if content else None
+        if not parts:
+            return ""
+
+        return "".join(
+            getattr(part, "text", "") or "" for part in parts
+        ).strip()
+    except Exception:
+        # Belt-and-suspenders: never let response parsing itself be the
+        # thing that raises out of generate().
+        return ""
+
 
 class GeminiClient(LLMClient):
 
@@ -220,9 +264,15 @@ class GeminiClient(LLMClient):
         user_input: str,
         model_name: str,
         temperature: Optional[float] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
 
+        # -------------------------------------------------------------
+        # Mock mode
+        # -------------------------------------------------------------
+
         if not self.api_key:
+
             return (
                 "[MOCK GEMINI RESPONSE - set GEMINI_API_KEY "
                 "in .env for real calls]\n"
@@ -240,15 +290,44 @@ class GeminiClient(LLMClient):
         if temperature is not None:
             config_kwargs["temperature"] = temperature
 
+        # -------------------------------------------------------------
+        # Persistent conversation history
+        # -------------------------------------------------------------
+
+        if messages:
+
+            contents = (
+                _convert_messages_to_gemini_contents(
+                    messages
+                )
+            )
+
+            if not contents:
+
+                contents = [
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_text(
+                                text=user_input
+                            )
+                        ],
+                    )
+                ]
+
+        else:
+
+            contents = user_input
+
         response = client.models.generate_content(
             model=model_name,
-            contents=user_input,
+            contents=contents,
             config=types.GenerateContentConfig(
                 **config_kwargs
             ),
         )
 
-        return response.text or ""
+        return _safe_gemini_text(response)
 
     # -----------------------------------------------------------------
     # Gemini tool declarations
@@ -259,23 +338,29 @@ class GeminiClient(LLMClient):
         tool_specs: List[Dict[str, Any]],
     ) -> List[types.Tool]:
 
-        declarations: List[types.FunctionDeclaration] = []
+        declarations: List[
+            types.FunctionDeclaration
+        ] = []
 
         for spec in tool_specs:
 
-            declaration = types.FunctionDeclaration(
-                name=spec["name"],
-                description=spec.get(
-                    "description",
-                    "",
-                ),
-                parameters_json_schema=spec.get(
-                    "parameters",
-                    {
-                        "type": "object",
-                        "properties": {},
-                    },
-                ),
+            declaration = (
+                types.FunctionDeclaration(
+                    name=spec["name"],
+                    description=spec.get(
+                        "description",
+                        "",
+                    ),
+                    parameters_json_schema=(
+                        spec.get(
+                            "parameters",
+                            {
+                                "type": "object",
+                                "properties": {},
+                            },
+                        )
+                    ),
+                )
             )
 
             declarations.append(
@@ -309,11 +394,14 @@ class GeminiClient(LLMClient):
             return {
                 "content": self.generate(
                     system_prompt=system_prompt,
-                    user_input=_extract_last_user_message(
-                        messages
+                    user_input=(
+                        _extract_last_user_message(
+                            messages
+                        )
                     ),
                     model_name=model_name,
                     temperature=temperature,
+                    messages=messages,
                 ),
                 "tool_calls": [],
             }
@@ -324,8 +412,10 @@ class GeminiClient(LLMClient):
             tool_specs
         )
 
-        contents = _convert_messages_to_gemini_contents(
-            messages
+        contents = (
+            _convert_messages_to_gemini_contents(
+                messages
+            )
         )
 
         if not contents:
@@ -426,7 +516,9 @@ class GeminiClient(LLMClient):
             **config_kwargs
         )
 
-        for _ in range(MAX_TOOL_ITERATIONS):
+        for _ in range(
+            MAX_TOOL_ITERATIONS
+        ):
 
             response = client.models.generate_content(
                 model=model_name,
@@ -440,7 +532,7 @@ class GeminiClient(LLMClient):
             )
 
             if not function_calls:
-                return response.text or ""
+                return _safe_gemini_text(response)
 
             model_content = (
                 response.candidates[0].content
@@ -479,14 +571,14 @@ class GeminiClient(LLMClient):
 
             contents.append(
                 types.Content(
-                    # Gemini does not accept role="tool"; function-response
-                    # content must be sent back with role="user".
                     role="user",
                     parts=response_parts,
                 )
             )
 
-        return "[No final response after tool calls]"
+        return (
+            "[No final response after tool calls]"
+        )
 
 
 # ---------------------------------------------------------------------
@@ -496,12 +588,6 @@ class GeminiClient(LLMClient):
 def _extract_thought_signature(
     part: Any,
 ) -> Optional[str]:
-    """
-    Extract and safely encode Gemini's opaque thought signature.
-
-    Gemini returns this as bytes. We encode it as base64 so it can
-    safely travel through our provider-independent LangGraph state.
-    """
 
     signature = getattr(
         part,
@@ -523,10 +609,13 @@ def _extract_thought_signature(
         return signature
 
     try:
+
         return base64.b64encode(
             bytes(signature)
         ).decode("ascii")
+
     except Exception:
+
         return str(signature)
 
 
@@ -544,10 +633,13 @@ def _decode_thought_signature(
         return None
 
     try:
+
         return base64.b64decode(
             signature.encode("ascii")
         )
+
     except Exception:
+
         return signature.encode("utf-8")
 
 
@@ -555,7 +647,10 @@ def _parse_gemini_response(
     response: Any,
 ) -> Dict[str, Any]:
 
-    tool_calls: List[Dict[str, Any]] = []
+    tool_calls: List[
+        Dict[str, Any]
+    ] = []
+
     content_parts: List[str] = []
 
     if not response.candidates:
@@ -567,11 +662,20 @@ def _parse_gemini_response(
 
     candidate = response.candidates[0]
 
-    if not candidate.content:
+    if not candidate.content or not candidate.content.parts:
+
+        finish_reason = getattr(
+            candidate, "finish_reason", None
+        )
 
         return {
             "content": None,
             "tool_calls": [],
+            "finish_reason": (
+                str(finish_reason)
+                if finish_reason is not None
+                else None
+            ),
         }
 
     for part in candidate.content.parts:
@@ -680,12 +784,17 @@ class GroqClient(LLMClient):
             self._groq = None
             self._sdk_available = False
 
+    # -----------------------------------------------------------------
+    # Normal generation
+    # -----------------------------------------------------------------
+
     def generate(
         self,
         system_prompt: str,
         user_input: str,
         model_name: str,
         temperature: Optional[float] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
 
         if (
@@ -705,18 +814,59 @@ class GroqClient(LLMClient):
             api_key=self.api_key
         )
 
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
+        groq_messages: List[
+            Dict[str, Any]
+        ] = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            }
+        ]
+
+        # -------------------------------------------------------------
+        # Persistent conversation history
+        # -------------------------------------------------------------
+
+        if messages:
+
+            for message in messages:
+
+                role = message.get(
+                    "role"
+                )
+
+                if role not in (
+                    "user",
+                    "assistant",
+                ):
+                    continue
+
+                content = message.get(
+                    "content",
+                    "",
+                )
+
+                groq_messages.append(
+                    {
+                        "role": role,
+                        "content": str(
+                            content
+                        ),
+                    }
+                )
+
+        else:
+
+            groq_messages.append(
                 {
                     "role": "user",
                     "content": user_input,
-                },
-            ],
+                }
+            )
+
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=groq_messages,
             temperature=(
                 temperature
                 if temperature is not None
@@ -728,6 +878,10 @@ class GroqClient(LLMClient):
             response.choices[0]
             .message.content
         )
+
+    # -----------------------------------------------------------------
+    # Tool calls
+    # -----------------------------------------------------------------
 
     def generate_with_tool_calls(
         self,
@@ -747,11 +901,14 @@ class GroqClient(LLMClient):
             return {
                 "content": self.generate(
                     system_prompt=system_prompt,
-                    user_input=_extract_last_user_message(
-                        messages
+                    user_input=(
+                        _extract_last_user_message(
+                            messages
+                        )
                     ),
                     model_name=model_name,
                     temperature=temperature,
+                    messages=messages,
                 ),
                 "tool_calls": [],
             }
@@ -768,14 +925,16 @@ class GroqClient(LLMClient):
             for spec in tool_specs
         ]
 
-        groq_messages: List[Dict[str, Any]] = [
+        groq_messages: List[
+            Dict[str, Any]
+        ] = [
             {
                 "role": "system",
                 "content": system_prompt,
             }
         ]
 
-        for message in messages:
+        for message in (messages or []):
 
             role = message.get("role")
 
@@ -795,35 +954,48 @@ class GroqClient(LLMClient):
 
             elif role == "assistant":
 
-                assistant_message: Dict[str, Any] = {
+                assistant_message: Dict[
+                    str,
+                    Any,
+                ] = {
                     "role": "assistant",
                     "content": message.get(
                         "content"
                     ),
                 }
 
-                internal_tool_calls = message.get(
-                    "tool_calls",
-                    [],
+                internal_tool_calls = (
+                    message.get(
+                        "tool_calls",
+                        [],
+                    )
                 )
 
                 if internal_tool_calls:
 
                     provider_tool_calls = []
 
-                    for tool_call in internal_tool_calls:
+                    for tool_call in (
+                        internal_tool_calls
+                    ):
 
-                        tool_name = tool_call.get(
-                            "name"
+                        tool_name = (
+                            tool_call.get(
+                                "name"
+                            )
                         )
 
-                        arguments = tool_call.get(
-                            "arguments",
-                            {},
+                        arguments = (
+                            tool_call.get(
+                                "arguments",
+                                {},
+                            )
                         )
 
-                        call_id = tool_call.get(
-                            "call_id"
+                        call_id = (
+                            tool_call.get(
+                                "call_id"
+                            )
                         )
 
                         if not tool_name:
@@ -871,7 +1043,9 @@ class GroqClient(LLMClient):
                 )
 
                 if not call_id:
-                    call_id = "unknown_tool_call"
+                    call_id = (
+                        "unknown_tool_call"
+                    )
 
                 groq_messages.append(
                     {
@@ -894,11 +1068,15 @@ class GroqClient(LLMClient):
 
         message = response.choices[0].message
 
-        tool_calls: List[Dict[str, Any]] = []
+        tool_calls: List[
+            Dict[str, Any]
+        ] = []
 
         if message.tool_calls:
 
-            for tool_call in message.tool_calls:
+            for tool_call in (
+                message.tool_calls
+            ):
 
                 try:
 
@@ -931,6 +1109,10 @@ class GroqClient(LLMClient):
             "content": message.content,
             "tool_calls": tool_calls,
         }
+
+    # -----------------------------------------------------------------
+    # Legacy-compatible tool loop API
+    # -----------------------------------------------------------------
 
     def generate_with_tools(
         self,
@@ -981,7 +1163,9 @@ class GroqClient(LLMClient):
             },
         ]
 
-        for _ in range(MAX_TOOL_ITERATIONS):
+        for _ in range(
+            MAX_TOOL_ITERATIONS
+        ):
 
             response = client.chat.completions.create(
                 model=model_name,
@@ -1056,7 +1240,9 @@ class GroqClient(LLMClient):
                     }
                 )
 
-        return "[No final response after tool calls]"
+        return (
+            "[No final response after tool calls]"
+        )
 
 
 # =====================================================================
@@ -1067,9 +1253,11 @@ def _convert_messages_to_gemini_contents(
     messages: List[Dict[str, Any]],
 ) -> List[types.Content]:
 
-    converted: List[types.Content] = []
+    converted: List[
+        types.Content
+    ] = []
 
-    for message in messages:
+    for message in (messages or []):
 
         role = message.get("role")
 
@@ -1103,7 +1291,9 @@ def _convert_messages_to_gemini_contents(
 
         if role == "assistant":
 
-            parts: List[types.Part] = []
+            parts: List[
+                types.Part
+            ] = []
 
             content = message.get(
                 "content"
@@ -1136,17 +1326,12 @@ def _convert_messages_to_gemini_contents(
                 if not tool_name:
                     continue
 
-                part = types.Part.from_function_call(
-                    name=tool_name,
-                    args=arguments,
+                part = (
+                    types.Part.from_function_call(
+                        name=tool_name,
+                        args=arguments,
+                    )
                 )
-
-                # -----------------------------------------------------
-                # CRITICAL:
-                #
-                # Gemini 3 requires the original thought signature
-                # to be attached to the exact function-call Part.
-                # -----------------------------------------------------
 
                 thought_signature = (
                     tool_call.get(
@@ -1216,8 +1401,6 @@ def _convert_messages_to_gemini_contents(
 
             converted.append(
                 types.Content(
-                    # Gemini does not accept role="tool"; function-response
-                    # content must be sent back with role="user".
                     role="user",
                     parts=[
                         types.Part.from_function_response(

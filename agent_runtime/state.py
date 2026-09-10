@@ -1,10 +1,9 @@
- 
 from typing import Any, Dict, List, Optional, TypedDict
 
 
 class AgentState(TypedDict, total=False):
     agent_id: str
-    user_id: Optional[str]
+    user_id: Optional[int]
 
     input: Any
 
@@ -16,6 +15,11 @@ class AgentState(TypedDict, total=False):
     provider: Optional[str]
     model: Optional[str]
 
+    # Persistent conversation history supplied by
+    # Conversation -> Manager -> Agent Runtime.
+    conversation_history: List[Dict[str, Any]]
+
+    # Messages used internally by the current LangGraph execution.
     messages: List[Dict[str, Any]]
 
     tool_calls: List[Dict[str, Any]]
@@ -29,4 +33,3 @@ class AgentState(TypedDict, total=False):
     status: str
 
     error: Optional[str]
- 

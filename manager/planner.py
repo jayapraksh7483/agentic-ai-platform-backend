@@ -44,6 +44,7 @@ from .prompts import (
     AGENT_PROPOSAL_USER_TEMPLATE,
     CAPABILITY_EXTRACTION_SYSTEM_PROMPT,
     CAPABILITY_EXTRACTION_USER_TEMPLATE,
+    DIRECT_RESPONSE_SYSTEM_PROMPT,
     REQUEST_CLASSIFICATION_SYSTEM_PROMPT,
     SYNTHESIS_SYSTEM_PROMPT,
     SYNTHESIS_USER_TEMPLATE,
@@ -899,6 +900,9 @@ def synthesize_final_response(
     ],
     provider: str,
     model: str,
+    conversation_history: Optional[
+        List[Dict[str, Any]]
+    ] = None,
 ) -> str:
     """
     Combine real results produced by executed agents into one
@@ -934,6 +938,9 @@ def synthesize_final_response(
                 )
             ),
             model_name=model,
+            messages=(
+                conversation_history or None
+            ),
         )
 
         if raw and raw.strip():
@@ -1032,3 +1039,44 @@ def classify_request(
         )
 
         return "agent_task"
+
+
+# =====================================================================
+# DIRECT RESPONSE
+# =====================================================================
+
+def generate_direct_response(
+    user_input: str,
+    provider: str,
+    model: str,
+    conversation_history: Optional[
+        List[Dict[str, Any]]
+    ] = None,
+) -> str:
+    """
+    Answer a GENERAL request directly, with no agent execution.
+
+    Only called after classify_request() has already decided the
+    request needs no specialized agent (greetings, small talk,
+    "what can you do", etc).
+    """
+
+    client = get_llm_client(
+        provider
+    )
+
+    raw = client.generate(
+        system_prompt=(
+            DIRECT_RESPONSE_SYSTEM_PROMPT
+        ),
+        user_input=user_input,
+        model_name=model,
+        messages=(
+            conversation_history or None
+        ),
+    )
+
+    return (raw or "").strip() or (
+        "I'm not sure how to respond to that."
+    )
+print("!!! PLANNER LOADED FROM:", __file__, flush=True)

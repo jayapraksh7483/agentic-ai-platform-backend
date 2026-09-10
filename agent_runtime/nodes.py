@@ -1,4 +1,3 @@
- 
 from typing import Any, Dict, List
 import json
 
@@ -18,8 +17,15 @@ def prepare_input(state: AgentState) -> AgentState:
 
     state["status"] = "running"
 
-    if "messages" not in state:
-        state["messages"] = []
+    history = state.get(
+        "conversation_history",
+        [],
+    )
+
+    state["messages"] = [
+        dict(message)
+        for message in history
+    ]
 
     state["messages"].append(
         {
@@ -60,7 +66,10 @@ def call_llm(state: AgentState) -> AgentState:
 
         tool_specs = _tool_specs()
 
-        messages = state.get("messages", [])
+        messages = state.get(
+            "messages",
+            [],
+        )
 
         # ---------------------------------------------------------
         # Tool-enabled execution
@@ -88,8 +97,8 @@ def call_llm(state: AgentState) -> AgentState:
             state["tool_calls"] = tool_calls
 
             # -----------------------------------------------------
-            # If the model requested tools, preserve the assistant
-            # tool-call message in conversation history.
+            # Model requested one or more tools.
+            # Preserve the assistant tool-call message.
             # -----------------------------------------------------
             if tool_calls:
 
@@ -103,13 +112,12 @@ def call_llm(state: AgentState) -> AgentState:
                     assistant_message
                 )
 
-                # The tool call is not the final answer.
                 state["output"] = None
 
                 return state
 
             # -----------------------------------------------------
-            # No tool call means this is the final LLM response.
+            # No tool call means this is the final response.
             # -----------------------------------------------------
             if content:
 
@@ -132,13 +140,25 @@ def call_llm(state: AgentState) -> AgentState:
         # Normal LLM execution without tools
         # ---------------------------------------------------------
         user_input = str(
-            state.get("input", "")
+            state.get(
+                "input",
+                "",
+            )
         )
 
+        # ---------------------------------------------------------
+        # IMPORTANT:
+        #
+        # Pass the complete conversation messages to the provider.
+        #
+        # This allows normal LLM agents to use persistent
+        # conversation history, just like tool-enabled agents.
+        # ---------------------------------------------------------
         response_text = client.generate(
             system_prompt=system_prompt,
             user_input=user_input,
             model_name=model,
+            messages=messages,
         )
 
         if response_text is None:
@@ -258,10 +278,6 @@ def execute_tool(state: AgentState) -> AgentState:
 
     # -------------------------------------------------------------
     # Add each tool result to the conversation.
-    #
-    # call_id is preserved so providers that support native
-    # tool-call protocols can associate the result with the
-    # corresponding tool request.
     # -------------------------------------------------------------
     for tool_result in current_results:
 
@@ -281,7 +297,7 @@ def execute_tool(state: AgentState) -> AgentState:
             }
         )
 
-    # The current tool calls have now been executed.
+    # Current tool calls have now been executed.
     state["tool_calls"] = []
 
     return state
@@ -307,4 +323,3 @@ def finalize_execution(state: AgentState) -> AgentState:
     state["status"] = "success"
 
     return state
- 

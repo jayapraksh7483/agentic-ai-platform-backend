@@ -94,6 +94,32 @@ OR
 {"request_type":"agent_task"}
 """
 
+# ---------------------------------------------------------------------
+# Direct response
+#
+# Only invoked when classify_request() decided the request is GENERAL --
+# a greeting, thanks, small talk, or a question about the platform
+# itself. No agent execution, no capability matching. The Manager just
+# answers directly and briefly, using conversation history for context.
+# ---------------------------------------------------------------------
+
+DIRECT_RESPONSE_SYSTEM_PROMPT = """You are the Manager Agent of an agentic AI platform.
+
+The user's message has already been classified as GENERAL conversation --
+a greeting, thanks, small talk, or a question about what the platform can
+do. It does NOT require running any specialized agent.
+
+Rules:
+- Respond directly, briefly, and naturally in plain language.
+- If asked what you/the platform can do, explain that specialized agents
+  handle tasks like calculations, SQL, and other domain-specific work,
+  and that new agents can be created on demand when nothing registered
+  can handle a request.
+- Do not fabricate specific capabilities, agent names, or data you don't
+  actually have.
+- Do not output JSON. Just the reply text.
+"""
+
 CAPABILITY_EXTRACTION_USER_TEMPLATE = """User request:
 {user_input}
 

@@ -43,6 +43,9 @@ def orchestrate(
     Understands the request, dynamically discovers registered
     agents belonging to the authenticated user, executes them,
     and returns the final response.
+
+    If conversation_id is provided, the orchestration execution
+    is linked to that persistent conversation.
     """
 
     try:
@@ -50,6 +53,17 @@ def orchestrate(
             db=db,
             user_input=request.user_input,
             user_id=current_user.id,
+            conversation_id=getattr(
+                request,
+                "conversation_id",
+                None,
+            ),
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
         )
 
     except Exception as exc:
@@ -57,7 +71,7 @@ def orchestrate(
 
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail="Orchestration failed unexpectedly.",
         )
 
 
@@ -79,19 +93,39 @@ def get_orchestration_status(
     orchestration execution.
     """
 
-    result = manager_service.get_execution(
-        db=db,
-        execution_id=execution_id,
-        user_id=current_user.id,
-    )
+    try:
+        result = manager_service.get_execution(
+            db=db,
+            execution_id=execution_id,
+            user_id=current_user.id,
+        )
 
-    if not result:
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail="Execution not found",
+            )
+
+        return result
+
+    except HTTPException:
+        raise
+
+    except ValueError:
         raise HTTPException(
             status_code=404,
             detail="Execution not found",
         )
 
-    return result
+    except Exception as exc:
+        logger.exception(
+            "Failed to retrieve orchestration execution"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
 
 
 # ============================================================
@@ -113,6 +147,9 @@ def approve_orchestration(
 
     Only the user who owns the orchestration execution can
     approve or reject it.
+
+    If approved, the manager re-runs the original request using
+    the conversation associated with the execution.
     """
 
     try:
