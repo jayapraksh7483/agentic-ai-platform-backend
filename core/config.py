@@ -2,22 +2,28 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # --- App ---
+    # =========================================================
+    # APP
+    # =========================================================
+
     APP_NAME: str = "Agentic AI Platform - Backend"
     ENV: str = "development"
 
-    # --- Database ---
+    # =========================================================
+    # DATABASE
+    # =========================================================
+
     DATABASE_URL: str = (
         "postgresql://postgres:postgres@localhost:5432/project_agent"
     )
 
-    # --- Auth / JWT ---
+    # =========================================================
+    # AUTH / JWT
+    # =========================================================
+
     SECRET_KEY: str = "CHANGE_ME_TO_A_RANDOM_SECRET"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
-    # Phase 5A addition -- refresh tokens are DB-backed (models/user.py
-    # RefreshToken), not JWTs, so this only controls how long a session
-    # row stays valid, not anything encoded in a token.
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # =========================================================
@@ -57,30 +63,74 @@ class Settings(BaseSettings):
     ANTHROPIC_DEFAULT_MODEL: str = "claude-sonnet-4-6"
 
     # =========================================================
+    # OPENAI
+    # =========================================================
+
+    OPENAI_API_KEY: str = ""
+
+    OPENAI_MODEL_1: str = "gpt-5"
+    OPENAI_MODEL_2: str = "gpt-5-mini"
+    OPENAI_MODEL_3: str = "gpt-5-nano"
+
+    OPENAI_DEFAULT_MODEL: str = "gpt-5-mini"
+
+    # =========================================================
     # EXECUTION ENGINE
     # =========================================================
 
     EXECUTION_TIMEOUT_SECONDS: int = 30
+    MAX_CONCURRENT_TASKS: int = 10
 
     # =========================================================
-    # MANAGER AGENT / ORCHESTRATION (Phase 4)
+    # MANAGER AGENT / ORCHESTRATION
     # =========================================================
 
-    # Hard ceiling on the number of plan "waves" the Manager Agent will
-    # execute for a single orchestration request. Prevents an uncontrolled
-    # replanning/execution loop.
     MAX_ORCHESTRATION_STEPS: int = 10
-
-    # Per-step retry budget for a step whose underlying agent execution
-    # fails (e.g. transient LLM/tool error). 0 = no retries.
     MAX_ORCHESTRATION_RETRIES: int = 2
-
-    # Wall-clock budget for a single orchestration request, in seconds.
     MAX_ORCHESTRATION_EXECUTION_TIME: int = 120
+
+    MAX_ORCHESTRATION_TASKS: int = 20
+    MAX_DEPENDENCY_DEPTH: int = 8
+
+    MAX_CONTEXT_CHARS: int = 16000
+
+    MAX_RETRIEVED_CHUNKS: int = 20
+
+    ALLOW_MOCK_EMBEDDINGS: bool = False
+
+    # =========================================================
+    # GOOGLE OAUTH
+    # =========================================================
+
+    # Loaded securely from .env
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+
+    GOOGLE_REDIRECT_URI: str = (
+        "http://localhost:9000/api/oauth/google/callback"
+    )
+
+    GOOGLE_OAUTH_SCOPES: str = (
+        "openid "
+        "https://www.googleapis.com/auth/userinfo.email "
+        "https://www.googleapis.com/auth/gmail.readonly "
+        "https://www.googleapis.com/auth/gmail.send "
+        "https://www.googleapis.com/auth/drive.readonly "
+        "https://www.googleapis.com/auth/calendar "
+        "https://www.googleapis.com/auth/spreadsheets"
+    )
+
+    # Fernet encryption key loaded securely from .env
+    TOKEN_ENCRYPTION_KEY: str = ""
+
+    # =========================================================
+    # PYDANTIC SETTINGS
+    # =========================================================
 
     model_config = SettingsConfigDict(
         env_file=".env",
-        extra="ignore"
+        env_file_encoding="utf-8",
+        extra="ignore",
     )
 
 

@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 
 class AgentState(TypedDict, total=False):
+    retryable: bool
     agent_id: str
     user_id: Optional[int]
 
@@ -14,6 +15,15 @@ class AgentState(TypedDict, total=False):
 
     provider: Optional[str]
     model: Optional[str]
+
+    # Per-agent overrides (models/agent.py: Agent.api_key_encrypted /
+    # temperature / tools). All three are None for every agent that
+    # doesn't set them -- the Manager Agent and the platform default
+    # agents never set any of these, so they see identical behavior
+    # to before this feature existed.
+    api_key: Optional[str]
+    temperature: Optional[float]
+    allowed_tools: Optional[List[str]]
 
     # Persistent conversation history supplied by
     # Conversation -> Manager -> Agent Runtime.

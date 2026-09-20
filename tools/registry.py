@@ -1,6 +1,7 @@
 from typing import Any, Dict, List
 
 from .base import BaseTool
+from jsonschema import Draft202012Validator
 
 
 class ToolRegistry:
@@ -155,6 +156,9 @@ class ToolRegistry:
         if not isinstance(arguments, dict):
             raise TypeError("Tool arguments must be a dictionary.")
 
+        if not isinstance(arguments, dict):
+            raise ValueError("Tool arguments must be an object.")
+        Draft202012Validator(tool.input_schema).validate(arguments)
         return tool.execute(**arguments)
 
 

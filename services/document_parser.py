@@ -102,37 +102,89 @@ def _extract_pdf(file_bytes: bytes) -> str:
 def _extract_docx(file_bytes: bytes) -> str:
     try:
         import zipfile
+        import xml.etree.ElementTree as ET
         from docx import Document
 
-        # Validate that this is actually a DOCX/ZIP package
-        if not zipfile.is_zipfile(io.BytesIO(file_bytes)):
+        buffer = io.BytesIO(file_bytes)
+
+        # A real DOCX is an OOXML ZIP package. Renamed .doc/.pdf files
+        # must still be rejected rather than producing garbage text.
+        if not zipfile.is_zipfile(buffer):
             raise DocumentParseError(
                 "The uploaded file is not a valid DOCX file. "
                 "Please upload a real .docx Word document."
             )
 
-        doc = Document(io.BytesIO(file_bytes))
+        buffer.seek(0)
+        doc = Document(buffer)
 
         parts = []
 
         for paragraph in doc.paragraphs:
-            if paragraph.text.strip():
-                parts.append(paragraph.text)
+            value = paragraph.text.strip()
+            if value:
+                parts.append(value)
 
-        # Also extract table content
         for table in doc.tables:
             for row in table.rows:
                 values = [
                     cell.text.strip()
                     for cell in row.cells
+                    if cell.text and cell.text.strip()
                 ]
-                parts.append(" | ".join(values))
+                if values:
+                    parts.append(" | ".join(values))
 
         text = "\n".join(parts).strip()
 
+        if text:
+            return text
+
+        # python-docx does not expose every OOXML text container (for
+        # example some text boxes/shapes, headers/footers and notes).
+        # Inspect Word XML text nodes before declaring the file empty.
+        xml_parts = []
+
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+            candidate_names = [
+                name
+                for name in archive.namelist()
+                if name.startswith("word/")
+                and name.endswith(".xml")
+                and (
+                    name == "word/document.xml"
+                    or name.startswith("word/header")
+                    or name.startswith("word/footer")
+                    or name in {
+                        "word/footnotes.xml",
+                        "word/endnotes.xml",
+                        "word/comments.xml",
+                    }
+                )
+            ]
+
+            for name in candidate_names:
+                try:
+                    root = ET.fromstring(archive.read(name))
+                except ET.ParseError:
+                    continue
+
+                values = []
+                for node in root.iter():
+                    if node.tag.endswith("}t") and node.text:
+                        value = node.text.strip()
+                        if value:
+                            values.append(value)
+
+                if values:
+                    xml_parts.append(" ".join(values))
+
+        text = "\n".join(xml_parts).strip()
+
         if not text:
             raise DocumentParseError(
-                "DOCX contains no extractable text."
+                "DOCX contains no extractable text. "
+                "If the document contains only images/scans, OCR is required."
             )
 
         return text

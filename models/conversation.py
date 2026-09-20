@@ -78,3 +78,17 @@ class Conversation(Base):
         back_populates="conversation",
         cascade="all, delete-orphan",
     )
+
+    # ---------------------------------------------------------
+    # Requirement 2 -- existing Knowledge Bases explicitly attached
+    # to this conversation (Option B). See
+    # models/conversation_knowledge_base.py /
+    # services/conversation_knowledge_service.py. Deleting a
+    # conversation only deletes these reference rows, never the
+    # Knowledge Bases themselves.
+    # ---------------------------------------------------------
+    knowledge_base_links = relationship(
+        "ConversationKnowledgeBase",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+    )

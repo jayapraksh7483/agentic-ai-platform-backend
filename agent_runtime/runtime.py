@@ -18,12 +18,26 @@ class AgentRuntime:
         thread_id: Optional[str] = None,
         execution_id: Optional[str] = None,
         conversation_history: Optional[list] = None,
+        api_key: Optional[str] = None,
+        temperature: Optional[float] = None,
+        allowed_tools: Optional[list] = None,
     ) -> Dict[str, Any]:
         """
         Execute an agent through the LangGraph runtime.
 
         conversation_history contains the messages that occurred
         before the current user request.
+
+        api_key / temperature / allowed_tools are the selected agent's
+        OWN configuration (models/agent.py), resolved and decrypted by
+        the caller (services/executor_service.py for direct execution,
+        manager/planner.py + manager/manager_agent.py for orchestrated
+        steps). None for all three means "no agent-specific override" --
+        the LLM service layer falls back to the platform-wide key for
+        `provider` and every registered tool stays available, which is
+        the existing behavior for every agent that predates this
+        feature (the Manager Agent and the platform default agents
+        never pass any of these).
         """
 
         initial_state = {
@@ -38,6 +52,10 @@ class AgentRuntime:
 
             "provider": provider,
             "model": model,
+
+            "api_key": api_key,
+            "temperature": temperature,
+            "allowed_tools": allowed_tools,
 
             "conversation_history": conversation_history or [],
 
@@ -64,6 +82,7 @@ class AgentRuntime:
                 "output": result.get("output"),
                 "status": result.get("status"),
                 "error": result.get("error"),
+                "retryable": result.get("retryable", False),
                 "messages": result.get(
                     "messages",
                     [],

@@ -1,8 +1,21 @@
+
 """
-Phase 5A business logic. Kept separate from api/auth.py the same way
-every other feature in this project separates services/ from api/
-(e.g. agent_service.py vs api/agents.py).
+Phase 5A -- Authentication business logic.
+
+This service handles:
+
+    - User registration
+    - User authentication
+    - Access-token creation
+    - Refresh-token rotation
+    - Refresh-token revocation
+    - Default-agent provisioning for newly registered users
+
+Default agents are provisioned after a user is successfully created.
+Each default agent is owned by that user through Agent.created_by.
 """
+
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
@@ -18,6 +31,10 @@ from core.security import (
 )
 from models.user import RefreshToken, User
 from schemas.auth import UserRegister
+from services.default_agent_service import provision_default_agents
+
+
+logger = logging.getLogger(__name__)
 
 
 class DuplicateEmailError(Exception):
@@ -32,118 +49,334 @@ class InvalidRefreshTokenError(Exception):
     pass
 
 
-def register_user(db: Session, data: UserRegister) -> User:
-    existing = db.query(User).filter(User.email == data.email).first()
+def register_user(
+    db: Session,
+    data: UserRegister,
+) -> User:
+    """
+    Register a new user and provision the platform's default agents.
+
+    Every newly registered user receives:
+
+        - Document Reader
+        - Web Search
+        - Calculator
+        - General Assistant
+
+    The default agents are user-owned through Agent.created_by.
+    """
+
+    normalized_email = str(
+        data.email
+    ).strip().lower()
+
+    existing = (
+        db.query(User)
+        .filter(User.email == normalized_email)
+        .first()
+    )
+
     if existing:
-        # Generic on purpose -- doesn't say "email already registered"
-        # vs "invalid email", just that this address can't be used.
-        raise DuplicateEmailError(f"An account with email '{data.email}' already exists")
+        raise DuplicateEmailError(
+            f"An account with email '{normalized_email}' already exists"
+        )
 
     user = User(
-        email=data.email,
+        email=normalized_email,
         password_hash=hash_password(data.password),
         name=data.name,
         is_active=True,
     )
+
     db.add(user)
     db.commit()
     db.refresh(user)
+
+    # ---------------------------------------------------------
+    # Provision the four default agents for this user.
+    #
+    # This happens after the user has been committed so that
+    # user.id is guaranteed to exist.
+    # ---------------------------------------------------------
+    try:
+        provision_default_agents(
+            db=db,
+            user_id=user.id,
+        )
+
+    except Exception:
+        # If default-agent provisioning fails, do not leave a
+        # partially-created account behind.
+        db.rollback()
+
+        # The user was already committed before provisioning.
+        # Delete the user explicitly so registration remains
+        # atomic from the application's perspective.
+        persisted_user = (
+            db.query(User)
+            .filter(User.id == user.id)
+            .first()
+        )
+
+        if persisted_user is not None:
+            db.delete(persisted_user)
+            db.commit()
+
+        raise
+
+    db.refresh(user)
+
     return user
 
 
-def authenticate_user(db: Session, email: str, password: str) -> User:
-    """Raises InvalidCredentialsError for EITHER a wrong email or a
-    wrong password -- deliberately the same error/message for both, so
-    a login attempt can't be used to enumerate which emails are
-    registered."""
-    user = db.query(User).filter(User.email == email).first()
-    if not user or not verify_password(password, user.password_hash):
-        raise InvalidCredentialsError("Incorrect email or password")
+def authenticate_user(
+    db: Session,
+    email: str,
+    password: str,
+) -> User:
+    """
+    Authenticate a user using email and password.
+    """
+
+    normalized_email = str(
+        email
+    ).strip().lower()
+
+    user = (
+        db.query(User)
+        .filter(User.email == normalized_email)
+        .first()
+    )
+
+    if user is None:
+        raise InvalidCredentialsError(
+            "Incorrect email or password"
+        )
+
+    if not verify_password(
+        password,
+        user.password_hash,
+    ):
+        raise InvalidCredentialsError(
+            "Incorrect email or password"
+        )
 
     if not user.is_active:
-        raise InvalidCredentialsError("Incorrect email or password")
+        raise InvalidCredentialsError(
+            "Incorrect email or password"
+        )
+
+    # Bug #1 fix: provision_default_agents() previously only ran in
+    # register_user(). Any account created before that code existed
+    # (or that otherwise lost its default agents) had zero default
+    # agents forever, since login never re-ran it. Also run it here,
+    # idempotently, on every successful login.
+    #
+    # provision_default_agents() must already be safe to call
+    # repeatedly for the same user (skip/upsert agents that already
+    # exist) -- it is not re-implemented here. Failures are swallowed
+    # so a provisioning problem never blocks login itself.
+    try:
+        provision_default_agents(
+            db=db,
+            user_id=user.id,
+        )
+    except Exception:
+        # Keep login valid even if default-agent sync fails.
+        # Roll back because a failed PostgreSQL statement leaves
+        # the SQLAlchemy transaction unusable until rollback.
+        db.rollback()
+        logger.exception(
+            "Default agent provisioning failed during login for user_id=%s",
+            user.id,
+        )
 
     return user
 
 
-def _issue_refresh_token(db: Session, user_id: int) -> str:
-    raw_token = generate_refresh_token_value()
-    expires_at = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+def _issue_refresh_token(
+    db: Session,
+    user_id: int,
+) -> str:
+    """
+    Create and persist a new opaque refresh token.
 
-    db.add(RefreshToken(
-        user_id=user_id,
-        token_hash=hash_refresh_token(raw_token),
-        expires_at=expires_at,
-    ))
+    Only the SHA-256 hash is stored in the database.
+    """
+
+    raw_token = generate_refresh_token_value()
+
+    expires_at = (
+        datetime.now(timezone.utc)
+        + timedelta(
+            days=settings.REFRESH_TOKEN_EXPIRE_DAYS
+        )
+    )
+
+    db.add(
+        RefreshToken(
+            user_id=user_id,
+            token_hash=hash_refresh_token(raw_token),
+            expires_at=expires_at,
+        )
+    )
+
     db.commit()
+
     return raw_token
 
 
-def create_tokens_for_user(db: Session, user: User) -> Tuple[str, str, int]:
-    """Returns (access_token, refresh_token_raw, expires_in_seconds)."""
+def create_tokens_for_user(
+    db: Session,
+    user: User,
+) -> Tuple[str, str, int]:
+    """
+    Returns:
+
+        access_token
+        refresh_token_raw
+        expires_in_seconds
+    """
+
     access_token = create_access_token(user.id)
-    refresh_token_raw = _issue_refresh_token(db, user.id)
-    expires_in = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
-    return access_token, refresh_token_raw, expires_in
+
+    refresh_token_raw = _issue_refresh_token(
+        db,
+        user.id,
+    )
+
+    expires_in = (
+        settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+
+    return (
+        access_token,
+        refresh_token_raw,
+        expires_in,
+    )
 
 
-def _get_valid_refresh_token_row(db: Session, raw_token: str) -> RefreshToken:
+def _get_valid_refresh_token_row(
+    db: Session,
+    raw_token: str,
+) -> RefreshToken:
+    """
+    Validate a refresh token and return its database row.
+    """
+
     token_hash = hash_refresh_token(raw_token)
-    row = db.query(RefreshToken).filter(RefreshToken.token_hash == token_hash).first()
+
+    row = (
+        db.query(RefreshToken)
+        .filter(
+            RefreshToken.token_hash == token_hash
+        )
+        .first()
+    )
 
     if row is None:
-        raise InvalidRefreshTokenError("Refresh token not recognized")
+        raise InvalidRefreshTokenError(
+            "Refresh token not recognized"
+        )
+
     if row.revoked_at is not None:
-        raise InvalidRefreshTokenError("Refresh token has been revoked")
-    if row.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
-        raise InvalidRefreshTokenError("Refresh token has expired")
+        raise InvalidRefreshTokenError(
+            "Refresh token has been revoked"
+        )
+
+    if (
+        row.expires_at.replace(
+            tzinfo=timezone.utc
+        )
+        < datetime.now(timezone.utc)
+    ):
+        raise InvalidRefreshTokenError(
+            "Refresh token has expired"
+        )
 
     return row
 
 
-def refresh_access_token(db: Session, raw_token: str) -> Tuple[str, str, int]:
+def refresh_access_token(
+    db: Session,
+    raw_token: str,
+) -> Tuple[str, str, int]:
     """
-    Validates the presented refresh token, then ROTATES it: the old
-    token row is revoked and a brand-new refresh token is issued along
-    with the new access token. The client must start using the new
-    refresh token -- the old one is now dead, even though it hadn't
-    expired yet.
+    Rotate a refresh token.
 
-    Rotation means a leaked-and-reused-later refresh token becomes
-    immediately detectable/dead after its first legitimate use, rather
-    than staying valid for its full multi-day lifetime.
+    The old refresh token is revoked and a new refresh token
+    is issued.
     """
-    row = _get_valid_refresh_token_row(db, raw_token)
 
-    user = db.query(User).filter(User.id == row.user_id).first()
+    row = _get_valid_refresh_token_row(
+        db,
+        raw_token,
+    )
+
+    user = (
+        db.query(User)
+        .filter(User.id == row.user_id)
+        .first()
+    )
+
     if user is None or not user.is_active:
-        raise InvalidRefreshTokenError("Refresh token not recognized")
+        raise InvalidRefreshTokenError(
+            "Refresh token not recognized"
+        )
 
     now = datetime.now(timezone.utc)
+
     row.revoked_at = now
     row.last_used_at = now
+
     db.add(row)
 
-    access_token = create_access_token(user.id)
-    new_refresh_token_raw = _issue_refresh_token(db, user.id)
-    expires_in = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    access_token = create_access_token(
+        user.id
+    )
+
+    new_refresh_token_raw = _issue_refresh_token(
+        db,
+        user.id,
+    )
+
+    expires_in = (
+        settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
 
     db.commit()
-    return access_token, new_refresh_token_raw, expires_in
+
+    return (
+        access_token,
+        new_refresh_token_raw,
+        expires_in,
+    )
 
 
-def revoke_refresh_token(db: Session, raw_token: str) -> None:
+def revoke_refresh_token(
+    db: Session,
+    raw_token: str,
+) -> None:
     """
-    Logout. Deliberately idempotent/quiet: whether the token was valid,
-    already revoked, expired, or simply never existed, this always
-    succeeds from the caller's point of view -- a logout endpoint that
-    can fail is more confusing than useful, and there's no information
-    worth protecting by distinguishing these cases here (unlike login).
+    Revoke a refresh token if it exists and has not already
+    been revoked.
     """
+
     token_hash = hash_refresh_token(raw_token)
-    row = db.query(RefreshToken).filter(RefreshToken.token_hash == token_hash).first()
+
+    row = (
+        db.query(RefreshToken)
+        .filter(
+            RefreshToken.token_hash == token_hash
+        )
+        .first()
+    )
 
     if row is not None and row.revoked_at is None:
-        row.revoked_at = datetime.now(timezone.utc)
+        row.revoked_at = datetime.now(
+            timezone.utc
+        )
+
         db.add(row)
         db.commit()
+

@@ -13,6 +13,10 @@ from models import (
     user,
     conversation,
     message,
+    attachment,
+    conversation_knowledge_base,
+    agent_api_key,
+    # google_connection,
 )
 
 from api import (
@@ -24,6 +28,9 @@ from api import (
     orchestration as orchestration_api,
     auth,
     conversations,
+    agent_api_keys,
+    public_agents,
+    oauth_google,
 )
 
 
@@ -32,7 +39,8 @@ app = FastAPI(
     description=(
         "Backend / control layer for the Agentic AI Platform - "
         "Agent Registry, Execution Engine, Discovery, "
-        "Orchestration, Authentication & Persistent Conversations."
+        "Orchestration, Authentication, Persistent Conversations "
+        "& Google Workspace Integration."
     ),
     version="1.0.0",
 )
@@ -75,32 +83,7 @@ app.add_middleware(
 # installed at the OS/PostgreSQL level.
 #
 
-with engine.connect() as _conn:
-    from sqlalchemy import text as _sql_text
-
-    if engine.dialect.name == "postgresql":
-        _conn.execute(
-            _sql_text(
-                "CREATE EXTENSION IF NOT EXISTS vector"
-            )
-        )
-        _conn.commit()
-
-
-# Create all SQLAlchemy tables.
-#
-# Development approach:
-#   Base.metadata.create_all()
-#
-# Production approach:
-#   Use Alembic migrations.
-#
-# Phase 5C models included here:
-#   conversations
-#   messages
-#
-Base.metadata.create_all(bind=engine)
-
+# Schema changes are applied explicitly through migrations, never during import.
 
 # ============================================================
 # API Routers
@@ -129,7 +112,11 @@ app.include_router(discovery.router)
 
 # Agent registry / management / execution
 app.include_router(agents.router)
+app.include_router(agent_api_keys.router)
 app.include_router(executions.router)
+
+# External application access to published user-created agents
+app.include_router(public_agents.router)
 
 # Knowledge Base / RAG
 app.include_router(knowledge_api.router)
@@ -139,6 +126,9 @@ app.include_router(orchestration_api.router)
 
 # Persistent Conversations + Messages
 app.include_router(conversations.router)
+
+# Google OAuth
+# app.include_router(oauth_google.router)
 
 
 # ============================================================

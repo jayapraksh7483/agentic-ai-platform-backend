@@ -1,4 +1,5 @@
 from typing import Any
+import math
 
 from .base import BaseTool
 
@@ -53,6 +54,12 @@ class CalculatorTool(BaseTool):
 
         if a is None or b is None:
             raise ValueError("Both 'a' and 'b' are required.")
+
+        for value in (a, b):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("Operands must be numbers.")
+            if not math.isfinite(value):
+                raise ValueError("Operands must be finite numbers.")
 
         if operation == "add":
             return a + b

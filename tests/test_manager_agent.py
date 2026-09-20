@@ -70,8 +70,53 @@ def _register_agent(db, name, capability):
 class FakeLLMClient:
     """Deterministic stand-in for services.llm_service's LLM client."""
 
-    def generate(self, system_prompt, user_input, model_name, temperature=None):
-        # --- Stage 0: general vs agent_task classification ---
+    def generate(self, system_prompt, user_input, model_name, temperature=None, messages=None):
+        # --- Phase 1: structured request understanding ---
+        # Mirrors the real contract in
+        # manager/prompts.py::REQUEST_UNDERSTANDING_SYSTEM_PROMPT.
+        if "request-understanding stage" in system_prompt:
+            text = user_input.lower().strip()
+            greeting_phrases = ("hello", "hi,", "hi ", "hey", "thanks", "how are you", "what can you do")
+            educational_markers = (
+                "what is ", "what are ", "explain ", "how does ",
+                "difference between ", "teach me ",
+            )
+            is_general = (
+                text.startswith(greeting_phrases)
+                or text.startswith(educational_markers)
+                or any(p in text for p in ("thanks", "how are you", "what can you do"))
+            )
+
+            if is_general:
+                return json.dumps({
+                    "intent": "GENERAL_ANSWER",
+                    "confidence": 0.95,
+                    "reason": "Greeting or platform question.",
+                    "requires_agent": False,
+                    "requires_multiple_agents": False,
+                    "requires_rag": False,
+                    "requires_document": False,
+                    "requires_knowledge_base": False,
+                    "requires_external_tool": False,
+                    "requires_approval": False,
+                    "required_capabilities": [],
+                })
+
+            return json.dumps({
+                "intent": "AGENT_EXECUTION",
+                "confidence": 0.9,
+                "reason": "Requires an action to be performed.",
+                "requires_agent": True,
+                "requires_multiple_agents": False,
+                "requires_rag": False,
+                "requires_document": False,
+                "requires_knowledge_base": False,
+                "requires_external_tool": False,
+                "requires_approval": False,
+                "required_capabilities": ["unspecified"],
+            })
+
+        # --- Legacy binary classification (kept for compatibility) ---
         if "Classify the user's request" in system_prompt:
             text = user_input.lower().strip()
             greeting_phrases = ("hello", "hi,", "hi ", "hey", "thanks", "how are you", "what can you do")
@@ -80,7 +125,10 @@ class FakeLLMClient:
             return '{"request_type": "agent_task"}'
 
         # --- Direct conversational response (general requests) ---
-        if "Answer simple conversational requests directly" in system_prompt:
+        if (
+            "Answer simple conversational requests directly" in system_prompt
+            or "classified as GENERAL" in system_prompt
+        ):
             return "Hello! I can understand requests, find the right registered agent, and run them for you."
 
         # --- Result synthesis ---
@@ -115,6 +163,8 @@ class FakeLLMClient:
                         "execution_mode": "parallel", "condition_keyword": None,
                         "unmatched_description": None,
                     })
+            if "completely unsupported" in text:
+                return json.dumps({"selected_capabilities": [], "unmatched_description": "handling this kind of request"})
             for keyword in ("calculat", "customer", "weather", "knowledge", "general", "handling"):
                 idx = find(keyword)
                 if idx is not None:
@@ -174,6 +224,17 @@ def test_greeting_gets_direct_response_not_agent_proposal(db_session):
     assert response.status == "success"
     assert "create" not in (response.result or "").lower()
     assert "should i go ahead" not in (response.result or "").lower()
+
+
+def test_educational_query_gets_direct_response_not_agent_proposal(db_session):
+    """Technical educational questions are still Manager-direct answers."""
+    from manager import service as manager_service
+
+    response = manager_service.orchestrate(db_session, "What is RAG?")
+
+    assert response.status == "success"
+    assert response.proposed_agent is None
+    assert response.error is None
 
 
 def test_single_agent_calculator(db_session):
@@ -250,14 +311,14 @@ def test_approve_creates_real_agent_from_proposal_and_reruns(db_session):
     from models.agent import Agent
     from models.orchestration import OrchestrationExecution
 
-    first = manager_service.orchestrate(db_session, "Do something completely unsupported.")
+    first = manager_service.orchestrate(db_session, "Do something completely unsupported.", user_id=1)
     assert first.status == "pending_agent_approval"
 
     row = db_session.query(OrchestrationExecution).get(first.execution_id)
     assert row.proposed_agent is not None
     assert row.proposed_agent["name"] == "General Purpose Agent"
 
-    approved = manager_service.approve_pending_agent(db_session, first.execution_id, approved=True)
+    approved = manager_service.approve_pending_agent(db_session, first.execution_id, approved=True, user_id=1)
     assert approved.status == "success"
 
     created = db_session.query(Agent).filter(Agent.name == "General Purpose Agent").first()
@@ -269,10 +330,10 @@ def test_decline_proposal_does_not_create_agent(db_session):
     from manager import service as manager_service
     from models.agent import Agent
 
-    first = manager_service.orchestrate(db_session, "Do something completely unsupported.")
+    first = manager_service.orchestrate(db_session, "Do something completely unsupported.", user_id=1)
     assert first.status == "pending_agent_approval"
 
-    declined = manager_service.approve_pending_agent(db_session, first.execution_id, approved=False)
+    declined = manager_service.approve_pending_agent(db_session, first.execution_id, approved=False, user_id=1)
 
     assert declined.status == "failed"
     assert "declined" in declined.error.lower()

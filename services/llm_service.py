@@ -25,8 +25,17 @@ from typing import Optional, List, Dict, Any, Callable
 from dotenv import load_dotenv
 
 from core.config import settings
-from google import genai
-from google.genai import types
+
+# Provider SDKs are optional at import time.  Keeping Gemini imports
+# lazy/failable means the application and tests can still start when a
+# provider-specific package is not installed, as long as that provider
+# is not actually used.
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:  # pragma: no cover - exercised only in minimal installs
+    genai = None
+    types = None
 
 
 # ---------------------------------------------------------------------
@@ -36,6 +45,39 @@ from google.genai import types
 load_dotenv()
 
 MAX_TOOL_ITERATIONS = 3
+
+def is_transient_overload_error(exc: Exception) -> bool:
+    """
+    PLACEHOLDER -- reconstructed from the import site only, not from
+    your original implementation (which I have not seen). Treats an
+    error as transient/retryable if it looks like a rate-limit or
+    overload response from any of the four providers. Replace this
+    with your real logic once you can paste it to me, or tell me your
+    original retry conditions and I'll match them exactly.
+    """
+    text = str(exc).lower()
+
+    transient_markers = (
+        "429",
+        "503",
+        "rate limit",
+        "rate_limit",
+        "resource_exhausted",
+        "overloaded",
+        "quota",
+        "too many requests",
+        "retry",
+    )
+
+    if any(marker in text for marker in transient_markers):
+        return True
+
+    status_code = getattr(exc, "status_code", None)
+    if status_code in (429, 503):
+        return True
+
+    return False
+
 
 
 def _env_value(
@@ -221,9 +263,13 @@ def _safe_gemini_text(response) -> str:
 
 class GeminiClient(LLMClient):
 
-    def __init__(self):
+    def __init__(self, api_key: Optional[str] = None):
 
-        self.api_key = _get_gemini_api_key()
+        # An explicit api_key (a per-agent override, e.g. a custom
+        # agent's own stored key) takes priority over the platform-wide
+        # key from settings/.env. Every existing call site passes no
+        # api_key at all, so this is fully backward compatible.
+        self.api_key = api_key or _get_gemini_api_key()
 
         self.default_model = _env_value(
             "GEMINI_DEFAULT_MODEL",
@@ -241,6 +287,11 @@ class GeminiClient(LLMClient):
     # -----------------------------------------------------------------
 
     def _get_client(self) -> genai.Client:
+
+        if genai is None or types is None:
+            raise RuntimeError(
+                "Gemini provider requires the 'google-genai' package."
+            )
 
         if not self.api_key:
             raise RuntimeError(
@@ -759,9 +810,10 @@ def _parse_gemini_response(
 
 class GroqClient(LLMClient):
 
-    def __init__(self):
+    def __init__(self, api_key: Optional[str] = None):
 
-        self.api_key = _get_groq_api_key()
+        # See GeminiClient.__init__ -- same override precedence.
+        self.api_key = api_key or _get_groq_api_key()
 
         self.default_model = _env_value(
             "GROQ_DEFAULT_MODEL",
@@ -1246,6 +1298,638 @@ class GroqClient(LLMClient):
 
 
 # =====================================================================
+# OPENAI / ANTHROPIC
+# =====================================================================
+
+def _get_anthropic_api_key() -> Optional[str]:
+    return _env_value(
+        "ANTHROPIC_API_KEY",
+        getattr(settings, "ANTHROPIC_API_KEY", None),
+    )
+
+
+def _get_openai_api_key() -> Optional[str]:
+    return _env_value(
+        "OPENAI_API_KEY",
+        getattr(settings, "OPENAI_API_KEY", None),
+    )
+
+
+# =====================================================================
+# OPENAI
+#
+# The OpenAI Python SDK's chat.completions.create() has the same
+# request/response shape Groq's SDK already mirrors here, so this
+# class is a near-exact copy of GroqClient with the SDK import and
+# mock-response text swapped.
+# =====================================================================
+
+class OpenAIClient(LLMClient):
+
+    def __init__(self, api_key: Optional[str] = None):
+
+        self.api_key = api_key or _get_openai_api_key()
+
+        self.default_model = _env_value(
+            "OPENAI_DEFAULT_MODEL",
+            getattr(settings, "OPENAI_DEFAULT_MODEL", None),
+        )
+
+        try:
+            import openai
+
+            self._openai = openai
+            self._sdk_available = True
+
+        except ImportError:
+            self._openai = None
+            self._sdk_available = False
+
+    def generate(
+        self,
+        system_prompt: str,
+        user_input: str,
+        model_name: str,
+        temperature: Optional[float] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+
+        if not self.api_key or not self._sdk_available:
+            return (
+                "[MOCK OPENAI RESPONSE - set OPENAI_API_KEY "
+                "in .env for real calls]\n"
+                f"model={model_name}\n"
+                f"system_prompt={system_prompt[:80]}...\n"
+                f"user_input={user_input}"
+            )
+
+        client = self._openai.OpenAI(api_key=self.api_key)
+
+        openai_messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt}
+        ]
+
+        if messages:
+            for message in messages:
+                role = message.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                openai_messages.append(
+                    {
+                        "role": role,
+                        "content": str(message.get("content", "")),
+                    }
+                )
+        else:
+            openai_messages.append(
+                {"role": "user", "content": user_input}
+            )
+
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=openai_messages,
+            temperature=(
+                temperature if temperature is not None else 0.7
+            ),
+        )
+
+        return response.choices[0].message.content
+
+    def generate_with_tool_calls(
+        self,
+        system_prompt: str,
+        messages: List[Dict[str, Any]],
+        model_name: str,
+        tool_specs: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+    ) -> Dict[str, Any]:
+
+        if (
+            not self.api_key
+            or not self._sdk_available
+            or not tool_specs
+        ):
+            return {
+                "content": self.generate(
+                    system_prompt=system_prompt,
+                    user_input=_extract_last_user_message(messages),
+                    model_name=model_name,
+                    temperature=temperature,
+                    messages=messages,
+                ),
+                "tool_calls": [],
+            }
+
+        client = self._openai.OpenAI(api_key=self.api_key)
+
+        tools_payload = [
+            {"type": "function", "function": spec}
+            for spec in tool_specs
+        ]
+
+        openai_messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt}
+        ]
+
+        for message in (messages or []):
+            role = message.get("role")
+
+            if role == "user":
+                openai_messages.append(
+                    {
+                        "role": "user",
+                        "content": str(message.get("content", "")),
+                    }
+                )
+
+            elif role == "assistant":
+                assistant_message: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": message.get("content"),
+                }
+
+                internal_tool_calls = message.get("tool_calls", [])
+
+                if internal_tool_calls:
+                    provider_tool_calls = []
+
+                    for tool_call in internal_tool_calls:
+                        tool_name = tool_call.get("name")
+                        arguments = tool_call.get("arguments", {})
+                        call_id = tool_call.get("call_id")
+
+                        if not tool_name:
+                            continue
+
+                        if not call_id:
+                            call_id = (
+                                f"tool_call_{len(provider_tool_calls) + 1}"
+                            )
+
+                        provider_tool_calls.append(
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": json.dumps(arguments),
+                                },
+                            }
+                        )
+
+                    if provider_tool_calls:
+                        assistant_message["tool_calls"] = (
+                            provider_tool_calls
+                        )
+
+                openai_messages.append(assistant_message)
+
+            elif role == "tool":
+                call_id = message.get("call_id") or "unknown_tool_call"
+                content = message.get("content", "")
+
+                openai_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": str(content),
+                    }
+                )
+
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=openai_messages,
+            tools=tools_payload,
+            temperature=(
+                temperature if temperature is not None else 0.7
+            ),
+        )
+
+        message = response.choices[0].message
+
+        tool_calls: List[Dict[str, Any]] = []
+
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                try:
+                    arguments = (
+                        json.loads(tool_call.function.arguments)
+                        if tool_call.function.arguments
+                        else {}
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {}
+
+                tool_calls.append(
+                    {
+                        "name": tool_call.function.name,
+                        "arguments": arguments,
+                        "call_id": tool_call.id,
+                    }
+                )
+
+        return {"content": message.content, "tool_calls": tool_calls}
+
+    def generate_with_tools(
+        self,
+        system_prompt: str,
+        user_input: str,
+        model_name: str,
+        tool_specs: List[Dict[str, Any]],
+        tool_call_handler: Callable[[str, Dict[str, Any]], Dict[str, Any]],
+        temperature: Optional[float] = None,
+    ) -> str:
+
+        if (
+            not self.api_key
+            or not self._sdk_available
+            or not tool_specs
+        ):
+            return self.generate(
+                system_prompt, user_input, model_name, temperature
+            )
+
+        client = self._openai.OpenAI(api_key=self.api_key)
+
+        tools_payload = [
+            {"type": "function", "function": spec}
+            for spec in tool_specs
+        ]
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input},
+        ]
+
+        for _ in range(MAX_TOOL_ITERATIONS):
+
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                tools=tools_payload,
+                temperature=(
+                    temperature if temperature is not None else 0.7
+                ),
+            )
+
+            message = response.choices[0].message
+
+            if not message.tool_calls:
+                return message.content
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in message.tool_calls
+                    ],
+                }
+            )
+
+            for tc in message.tool_calls:
+                try:
+                    tool_args = (
+                        json.loads(tc.function.arguments)
+                        if tc.function.arguments
+                        else {}
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    tool_args = {}
+
+                tool_result = tool_call_handler(
+                    tc.function.name, tool_args
+                )
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps(tool_result, default=str),
+                    }
+                )
+
+        return "[No final response after tool calls]"
+
+
+# =====================================================================
+# ANTHROPIC
+#
+# Different shape from the two above: `system` is a top-level request
+# param (never a message), there is no "tool" role -- a tool result is
+# sent back as a "user" message containing a tool_result content
+# block -- and every response is a list of content blocks
+# ("text" and/or "tool_use"), not a single message.content string.
+# max_tokens is required by Anthropic's API (no server-side default).
+# =====================================================================
+
+ANTHROPIC_MAX_TOKENS = 4096
+
+
+class AnthropicClient(LLMClient):
+
+    def __init__(self, api_key: Optional[str] = None):
+
+        self.api_key = api_key or _get_anthropic_api_key()
+
+        self.default_model = _env_value(
+            "ANTHROPIC_DEFAULT_MODEL",
+            getattr(settings, "ANTHROPIC_DEFAULT_MODEL", None),
+        )
+
+        try:
+            import anthropic
+
+            self._anthropic = anthropic
+            self._sdk_available = True
+
+        except ImportError:
+            self._anthropic = None
+            self._sdk_available = False
+
+    def _client(self):
+        return self._anthropic.Anthropic(api_key=self.api_key)
+
+    @staticmethod
+    def _extract_text(content_blocks) -> str:
+        return "".join(
+            block.text
+            for block in content_blocks
+            if getattr(block, "type", None) == "text"
+        ).strip()
+
+    def generate(
+        self,
+        system_prompt: str,
+        user_input: str,
+        model_name: str,
+        temperature: Optional[float] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+
+        if not self.api_key or not self._sdk_available:
+            return (
+                "[MOCK ANTHROPIC RESPONSE - set ANTHROPIC_API_KEY "
+                "in .env for real calls]\n"
+                f"model={model_name}\n"
+                f"system_prompt={system_prompt[:80]}...\n"
+                f"user_input={user_input}"
+            )
+
+        client = self._client()
+
+        anthropic_messages: List[Dict[str, Any]] = []
+
+        if messages:
+            for message in messages:
+                role = message.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                anthropic_messages.append(
+                    {
+                        "role": role,
+                        "content": str(message.get("content", "")),
+                    }
+                )
+        else:
+            anthropic_messages.append(
+                {"role": "user", "content": user_input}
+            )
+
+        response = client.messages.create(
+            model=model_name,
+            system=system_prompt,
+            messages=anthropic_messages,
+            max_tokens=ANTHROPIC_MAX_TOKENS,
+            temperature=(
+                temperature if temperature is not None else 0.7
+            ),
+        )
+
+        return self._extract_text(response.content)
+
+    def generate_with_tool_calls(
+        self,
+        system_prompt: str,
+        messages: List[Dict[str, Any]],
+        model_name: str,
+        tool_specs: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+    ) -> Dict[str, Any]:
+
+        if (
+            not self.api_key
+            or not self._sdk_available
+            or not tool_specs
+        ):
+            return {
+                "content": self.generate(
+                    system_prompt=system_prompt,
+                    user_input=_extract_last_user_message(messages),
+                    model_name=model_name,
+                    temperature=temperature,
+                    messages=messages,
+                ),
+                "tool_calls": [],
+            }
+
+        client = self._client()
+
+        tools_payload = [
+            {
+                "name": spec["name"],
+                "description": spec.get("description", ""),
+                "input_schema": spec.get(
+                    "parameters",
+                    {"type": "object", "properties": {}},
+                ),
+            }
+            for spec in tool_specs
+        ]
+
+        anthropic_messages: List[Dict[str, Any]] = []
+
+        for message in (messages or []):
+            role = message.get("role")
+
+            if role == "user":
+                anthropic_messages.append(
+                    {
+                        "role": "user",
+                        "content": str(message.get("content", "")),
+                    }
+                )
+
+            elif role == "assistant":
+                blocks: List[Dict[str, Any]] = []
+
+                text_content = message.get("content")
+                if text_content:
+                    blocks.append(
+                        {"type": "text", "text": str(text_content)}
+                    )
+
+                for tool_call in message.get("tool_calls", []):
+                    tool_name = tool_call.get("name")
+                    if not tool_name:
+                        continue
+
+                    call_id = tool_call.get("call_id") or (
+                        f"toolu_{len(blocks) + 1}"
+                    )
+
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": tool_name,
+                            "input": tool_call.get("arguments", {}),
+                        }
+                    )
+
+                if blocks:
+                    anthropic_messages.append(
+                        {"role": "assistant", "content": blocks}
+                    )
+
+            elif role == "tool":
+                # Anthropic has no "tool" role -- a tool result goes
+                # back as a user message containing a tool_result
+                # block referencing the matching tool_use id.
+                call_id = message.get("call_id") or "unknown_tool_call"
+                content = message.get("content", "")
+
+                anthropic_messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": call_id,
+                                "content": str(content),
+                            }
+                        ],
+                    }
+                )
+
+        response = client.messages.create(
+            model=model_name,
+            system=system_prompt,
+            messages=anthropic_messages,
+            tools=tools_payload,
+            max_tokens=ANTHROPIC_MAX_TOKENS,
+            temperature=(
+                temperature if temperature is not None else 0.7
+            ),
+        )
+
+        tool_calls: List[Dict[str, Any]] = []
+
+        for block in response.content:
+            if getattr(block, "type", None) == "tool_use":
+                tool_calls.append(
+                    {
+                        "name": block.name,
+                        "arguments": block.input or {},
+                        "call_id": block.id,
+                    }
+                )
+
+        return {
+            "content": self._extract_text(response.content),
+            "tool_calls": tool_calls,
+        }
+
+    def generate_with_tools(
+        self,
+        system_prompt: str,
+        user_input: str,
+        model_name: str,
+        tool_specs: List[Dict[str, Any]],
+        tool_call_handler: Callable[[str, Dict[str, Any]], Dict[str, Any]],
+        temperature: Optional[float] = None,
+    ) -> str:
+
+        if (
+            not self.api_key
+            or not self._sdk_available
+            or not tool_specs
+        ):
+            return self.generate(
+                system_prompt, user_input, model_name, temperature
+            )
+
+        client = self._client()
+
+        tools_payload = [
+            {
+                "name": spec["name"],
+                "description": spec.get("description", ""),
+                "input_schema": spec.get(
+                    "parameters",
+                    {"type": "object", "properties": {}},
+                ),
+            }
+            for spec in tool_specs
+        ]
+
+        messages = [{"role": "user", "content": user_input}]
+
+        for _ in range(MAX_TOOL_ITERATIONS):
+
+            response = client.messages.create(
+                model=model_name,
+                system=system_prompt,
+                messages=messages,
+                tools=tools_payload,
+                max_tokens=ANTHROPIC_MAX_TOKENS,
+                temperature=(
+                    temperature if temperature is not None else 0.7
+                ),
+            )
+
+            tool_use_blocks = [
+                block
+                for block in response.content
+                if getattr(block, "type", None) == "tool_use"
+            ]
+
+            if not tool_use_blocks:
+                return self._extract_text(response.content)
+
+            messages.append(
+                {"role": "assistant", "content": response.content}
+            )
+
+            result_blocks = []
+
+            for block in tool_use_blocks:
+                tool_result = tool_call_handler(
+                    block.name, block.input or {}
+                )
+
+                result_blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(tool_result, default=str),
+                    }
+                )
+
+            messages.append({"role": "user", "content": result_blocks})
+
+        return "[No final response after tool calls]"
+
+
+# =====================================================================
 # GEMINI MESSAGE CONVERSION
 # =====================================================================
 
@@ -1448,6 +2132,8 @@ def _extract_last_user_message(
 PROVIDER_REGISTRY = {
     "gemini": GeminiClient,
     "groq": GroqClient,
+    "openai": OpenAIClient,
+    "anthropic": AnthropicClient,
 }
 
 
@@ -1459,7 +2145,29 @@ _client_cache: Dict[
 
 def get_llm_client(
     provider: str,
+    api_key: Optional[str] = None,
 ) -> LLMClient:
+    """
+    Resolve the LLMClient for `provider`.
+
+    Two paths:
+
+    api_key is None (the vast majority of calls -- the Manager Agent,
+    default agents, and any custom agent with no key of its own):
+        Return the existing process-wide cached singleton for this
+        provider, exactly as before this parameter existed. Behavior
+        for every current call site is unchanged.
+
+    api_key is provided (a custom agent with its own stored,
+    decrypted key -- see services/agent_service.py):
+        Build a fresh, UNCACHED client instance bound to that key and
+        return it directly. This deliberately bypasses _client_cache:
+        the cache is a single shared, process-wide dict keyed only by
+        provider name, so caching a keyed client there would leak one
+        user's API key into every other request for that provider,
+        including other users' agents and the platform default agents.
+        A short-lived instance per call is the correct tradeoff here.
+    """
 
     provider_key = (
         provider or "gemini"
@@ -1477,6 +2185,12 @@ def get_llm_client(
             f"Supported providers: {supported}"
         )
 
+    if api_key:
+
+        return PROVIDER_REGISTRY[
+            provider_key
+        ](api_key=api_key)
+
     if provider_key not in _client_cache:
 
         _client_cache[provider_key] = (
@@ -1488,3 +2202,5 @@ def get_llm_client(
     return _client_cache[
         provider_key
     ]
+
+ 

@@ -1,50 +1,135 @@
-"""
-Text chunking for RAG (Sumith spec: 500 tokens, 50 token overlap).
 
-NOTE ON TOKEN COUNTING: this uses a simple word-count approximation
-(1 "token" ~= 1 word-ish unit) rather than a real tokenizer, since the
-project doesn't otherwise depend on tiktoken or a model-specific
-tokenizer. This is close enough for chunk-sizing purposes -- the exact
-boundary doesn't need to be precise, it just needs to keep chunks a
-reasonable, consistent size with overlap for context continuity. If you
-want exact token counts matching a specific model's tokenizer, install
-`tiktoken` and swap _approximate_tokenize() for a real tokenizer's
-encode/decode.
 """
+Text chunking for the LangChain RAG pipeline.
+
+Target configuration:
+    Chunk size: 500 tokens
+    Chunk overlap: 50 tokens
+
+LangChain is now responsible for text splitting.
+
+We use RecursiveCharacterTextSplitter because it preserves natural
+document boundaries where possible (paragraphs, lines, sentences, etc.)
+instead of blindly cutting every N words.
+
+The existing chunk_text() function is preserved so the rest of the
+application can migrate without changing its API immediately.
+"""
+
 from typing import List
 
-
-def _approximate_tokenize(text: str) -> List[str]:
-    return text.split()
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
-def _detokenize(tokens: List[str]) -> str:
-    return " ".join(tokens)
+# ---------------------------------------------------------------------------
+# Default RAG chunk configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_CHUNK_SIZE = 500
+DEFAULT_CHUNK_OVERLAP = 50
 
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+# ---------------------------------------------------------------------------
+# LangChain splitter
+# ---------------------------------------------------------------------------
+
+def _create_splitter(
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> RecursiveCharacterTextSplitter:
     """
-    Splits text into overlapping chunks. Each chunk has `chunk_size`
-    tokens (approx.), and each subsequent chunk starts `chunk_size -
-    overlap` tokens after the previous one's start, so `overlap` tokens
-    of context carry over between adjacent chunks.
-    """
-    if chunk_size <= overlap:
-        raise ValueError("chunk_size must be greater than overlap")
+    Create the LangChain text splitter.
 
-    tokens = _approximate_tokenize(text)
-    if not tokens:
+    The separator hierarchy attempts to preserve:
+        1. paragraphs
+        2. lines
+        3. sentences
+        4. words
+        5. individual characters
+
+    This gives better RAG chunks than a simple word-count split.
+    """
+
+    if chunk_size <= chunk_overlap:
+        raise ValueError(
+            "chunk_size must be greater than overlap"
+        )
+
+    return RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=[
+            "\n\n",
+            "\n",
+            ". ",
+            "? ",
+            "! ",
+            ", ",
+            " ",
+            "",
+        ],
+        length_function=_approximate_token_count,
+        is_separator_regex=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Token-size approximation
+# ---------------------------------------------------------------------------
+
+def _approximate_token_count(text: str) -> int:
+    """
+    Approximate token count.
+
+    This keeps the existing platform behavior where approximately one
+    word-like unit is treated as one token.
+
+    Later, if exact model token counting becomes necessary, this function
+    can be replaced with a model-specific tokenizer without changing the
+    rest of the RAG architecture.
+    """
+
+    return len(text.split())
+
+
+# ---------------------------------------------------------------------------
+# Public chunking API
+# ---------------------------------------------------------------------------
+
+def chunk_text(
+    text: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> List[str]:
+    """
+    Split text into overlapping LangChain RAG chunks.
+
+    Args:
+        text:
+            Source document text.
+
+        chunk_size:
+            Target chunk size, approximately measured in tokens.
+
+        overlap:
+            Approximate overlap between adjacent chunks.
+
+    Returns:
+        List of chunk strings.
+    """
+
+    if not text or not text.strip():
         return []
 
-    chunks = []
-    step = chunk_size - overlap
-    start = 0
-    while start < len(tokens):
-        end = start + chunk_size
-        chunk_tokens = tokens[start:end]
-        chunks.append(_detokenize(chunk_tokens))
-        if end >= len(tokens):
-            break
-        start += step
+    splitter = _create_splitter(
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
+    )
 
-    return chunks
+    documents = splitter.create_documents([text])
+
+    return [
+        document.page_content
+        for document in documents
+        if document.page_content.strip()
+    ]

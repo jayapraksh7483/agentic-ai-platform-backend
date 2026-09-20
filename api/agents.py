@@ -14,7 +14,7 @@ from schemas.agent import (
     AgentUpdate,
     AgentOut,
     AgentStatusUpdate,
-    ModelConfig,
+    ModelConfigOut,
     AgentExecuteRequest,
     AgentExecuteResponse,
 )
@@ -25,6 +25,7 @@ from services import (
     builder_service,
     validator_service,
 )
+from services.agent_service import _mask_api_key
 
 
 router = APIRouter(
@@ -51,14 +52,31 @@ def _to_out(agent) -> AgentOut:
         status=agent.status,
         current_version=agent.current_version,
         system_prompt=agent.system_prompt,
-        model_cfg=ModelConfig(
+
+        model_cfg=ModelConfigOut(
             provider=agent.provider,
             model=agent.model,
+            temperature=agent.temperature,
+            api_key_configured=bool(agent.api_key_encrypted),
+            api_key_preview=_mask_api_key(agent.api_key_last4),
         ),
+
         input_schema=agent.input_schema,
         output_schema=agent.output_schema,
+
+        tools=agent.tools,
+
         is_rag=agent.is_rag,
         knowledge_base_id=agent.knowledge_base_id,
+
+        visibility=getattr(agent, "visibility", "private"),
+        timeout_seconds=getattr(agent, "timeout_seconds", 30),
+        max_retries=getattr(agent, "max_retries", 2),
+        requires_approval=getattr(agent, "requires_approval", False),
+
+        # Important for frontend grouping
+        is_default=agent.is_default,
+
         capabilities=[
             c.capability_name
             for c in agent.capabilities
@@ -73,8 +91,10 @@ def _to_out(agent) -> AgentOut:
 @router.post("/build")
 def build_agent(
     request: AgentBuildRequest,
+    current_user=Depends(get_current_user),
 ):
     try:
+
         service = builder_service.BuilderService()
 
         specification = service.build_agent(
@@ -85,16 +105,20 @@ def build_agent(
 
         return {
             "data": specification,
-            "message": "Agent specification generated successfully",
+            "message": (
+                "Agent specification generated successfully"
+            ),
         }
 
     except ValueError as exc:
+
         raise HTTPException(
             status_code=422,
             detail=str(exc),
         )
 
     except Exception as exc:
+
         raise HTTPException(
             status_code=500,
             detail=str(exc),
@@ -108,24 +132,31 @@ def build_agent(
 @router.post("/validate")
 def validate_agent(
     request: AgentValidateRequest,
+    current_user=Depends(get_current_user),
 ):
+
     try:
+
         result = validator_service.validator_service.validate(
             request.spec
         )
 
         return {
             "data": result,
-            "message": "Agent specification validation completed",
+            "message": (
+                "Agent specification validation completed"
+            ),
         }
 
     except ValueError as exc:
+
         raise HTTPException(
             status_code=422,
             detail=str(exc),
         )
 
     except Exception as exc:
+
         raise HTTPException(
             status_code=500,
             detail=str(exc),
@@ -146,18 +177,18 @@ def register_agent(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """
-    Register a new agent for the authenticated user.
-    """
 
     try:
+
         agent = agent_service.create_agent(
             db,
             agent_in,
             created_by=current_user.id,
+            is_default=False,
         )
 
     except ValueError as e:
+
         raise HTTPException(
             status_code=422,
             detail=str(e),
@@ -176,7 +207,13 @@ def list_agents(
     current_user=Depends(get_current_user),
 ):
     """
-    Return only agents owned by the authenticated user.
+    Return all agents belonging to the authenticated user.
+
+    This includes:
+        - platform default agents
+        - user-created agents
+
+    Frontend separates them using is_default.
     """
 
     agents = agent_service.list_agents(
@@ -200,9 +237,6 @@ def get_agent(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """
-    Return an agent only if it belongs to the authenticated user.
-    """
 
     agent = agent_service.get_agent(
         db,
@@ -211,6 +245,7 @@ def get_agent(
     )
 
     if not agent:
+
         raise HTTPException(
             status_code=404,
             detail="Agent not found",
@@ -229,11 +264,9 @@ def update_agent(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """
-    Update an agent only if it belongs to the authenticated user.
-    """
 
     try:
+
         agent = agent_service.update_agent(
             db,
             agent_id,
@@ -242,12 +275,14 @@ def update_agent(
         )
 
     except ValueError as e:
+
         raise HTTPException(
             status_code=422,
             detail=str(e),
         )
 
     if not agent:
+
         raise HTTPException(
             status_code=404,
             detail="Agent not found",
@@ -265,17 +300,21 @@ def delete_agent(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """
-    Delete an agent only if it belongs to the authenticated user.
-    """
 
-    deleted = agent_service.delete_agent(
-        db,
-        agent_id,
-        owner_id=current_user.id,
-    )
+    try:
+        deleted = agent_service.delete_agent(
+            db,
+            agent_id,
+            owner_id=current_user.id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        )
 
     if not deleted:
+
         raise HTTPException(
             status_code=404,
             detail="Agent not found",
@@ -294,9 +333,6 @@ def set_agent_status(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """
-    Change agent status only if it belongs to the authenticated user.
-    """
 
     agent = agent_service.set_agent_status(
         db,
@@ -306,6 +342,7 @@ def set_agent_status(
     )
 
     if not agent:
+
         raise HTTPException(
             status_code=404,
             detail="Agent not found",
@@ -328,35 +365,34 @@ def execute_agent(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """
-    Execute an agent.
-
-    Authentication is required here, but ownership enforcement
-    is handled in the executor layer in the next Phase 5B step.
-    """
 
     try:
+
         result = executor_service.execute_agent(
             db,
             agent_id,
             request,
+            user_id=current_user.id,
         )
 
         return result
 
     except executor_service.AgentNotFoundError as e:
+
         raise HTTPException(
             status_code=404,
             detail=str(e),
         )
 
     except executor_service.AgentInactiveError as e:
+
         raise HTTPException(
             status_code=400,
             detail=str(e),
         )
 
     except ValueError as e:
+
         raise HTTPException(
             status_code=422,
             detail=str(e),

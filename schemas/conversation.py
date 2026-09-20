@@ -71,6 +71,13 @@ class ChatRequest(BaseModel):
         min_length=1
     )
 
+    # Optional per-message override of which LLM the Manager itself
+    # reasons with (classification, capability extraction, direct
+    # response, synthesis). None/omitted -> orchestrate()'s existing
+    # default ("gemini", settings default model) is unchanged.
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
 
 class ChatResponse(BaseModel):
     conversation_id: str
@@ -84,3 +91,54 @@ class ChatResponse(BaseModel):
     status: str
 
     error: Optional[str] = None
+
+class AttachmentResponse(BaseModel):
+    id: int
+    conversation_id: str
+    user_id: int
+    filename: str
+    content_type: Optional[str] = None
+    file_size: Optional[int] = None
+    knowledge_document_id: Optional[str] = None
+    knowledge_base_id: Optional[str] = None
+    status: str
+    error_message: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(
+        from_attributes=True,
+    )
+
+
+class AttachmentListResponse(BaseModel):
+    attachments: List[AttachmentResponse]
+
+
+# ============================================================
+# Requirement 2 -- Attaching an EXISTING Knowledge Base
+# ============================================================
+
+class AttachKnowledgeBaseRequest(BaseModel):
+    knowledge_base_id: str
+
+
+class AttachedKnowledgeBaseResponse(BaseModel):
+    """
+    A Knowledge Base attached to a conversation (Option B). Deliberately
+    the same shape a frontend would want for the "Attach Knowledge"
+    checklist -- id/name/description -- so the same response can
+    populate both "already attached" and "available to attach" lists.
+    """
+
+    id: str
+    name: str
+    description: Optional[str] = None
+    document_count: int
+
+    model_config = ConfigDict(
+        from_attributes=True,
+    )
+
+
+class AttachedKnowledgeBaseListResponse(BaseModel):
+    knowledge_bases: List[AttachedKnowledgeBaseResponse]

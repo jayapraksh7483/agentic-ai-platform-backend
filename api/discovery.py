@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from core.database import get_db
+from core.security import get_current_user
+from api.agents import _to_out
  
 from models.agent import AgentStatus
  
@@ -19,7 +21,7 @@ def discover_agents(
     capability: Optional[str] = None,
     status_filter: Optional[AgentStatus] = AgentStatus.ACTIVE,
     db: Session = Depends(get_db),
- 
+    current_user=Depends(get_current_user),
 ):
     """
     Example: GET /api/agents/discover?capability=sql_query
@@ -32,23 +34,7 @@ def discover_agents(
         db,
         capability=capability,
         status_filter=status_filter,
+        owner_id=current_user.id,
     )
 
-    return [
-        AgentOut(
-            id=a.id,
-            name=a.name,
-            description=a.description,
-            status=a.status,
-            current_version=a.current_version,
-            system_prompt=a.system_prompt,
-            model_cfg=ModelConfig(
-                provider=a.provider,
-                model=a.model,
-            ),
-            input_schema=a.input_schema,
-            output_schema=a.output_schema,
-            capabilities=[c.capability_name for c in a.capabilities],
-        )
-        for a in agents
-    ]
+    return [_to_out(agent) for agent in agents]

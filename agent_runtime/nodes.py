@@ -1,7 +1,7 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import json
 
-from services.llm_service import build_tool_spec, get_llm_client
+from services.llm_service import build_tool_spec, get_llm_client, is_transient_overload_error
 from .state import AgentState
 from .tool_loop import normalize_tool_calls
 
@@ -37,10 +37,26 @@ def prepare_input(state: AgentState) -> AgentState:
     return state
 
 
-def _tool_specs() -> List[Dict[str, Any]]:
+def _tool_specs(
+    allowed_tools: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     from tools import tool_registry
 
     definitions = tool_registry.get_tool_definitions()
+
+    if allowed_tools is not None:
+        # Explicit restriction (models/agent.py: Agent.tools). An empty
+        # list here means "no tools" -- distinct from allowed_tools
+        # being None, which means "unrestricted" (every agent that
+        # predates this field, including the Manager Agent and the
+        # platform default agents, always passes None and keeps seeing
+        # every registered tool exactly as before).
+        allowed_set = set(allowed_tools)
+        definitions = [
+            tool
+            for tool in definitions
+            if tool["name"] in allowed_set
+        ]
 
     return [
         build_tool_spec(
@@ -62,9 +78,14 @@ def call_llm(state: AgentState) -> AgentState:
 
         system_prompt = state.get("system_prompt") or ""
 
-        client = get_llm_client(provider)
+        # Per-agent overrides (models/agent.py). Both None for every
+        # agent that doesn't set them -- see state.py / runtime.py.
+        api_key = state.get("api_key")
+        temperature = state.get("temperature")
 
-        tool_specs = _tool_specs()
+        client = get_llm_client(provider, api_key=api_key)
+
+        tool_specs = _tool_specs(state.get("allowed_tools"))
 
         messages = state.get(
             "messages",
@@ -81,6 +102,7 @@ def call_llm(state: AgentState) -> AgentState:
                 messages=messages,
                 model_name=model,
                 tool_specs=tool_specs,
+                temperature=temperature,
             )
 
             content = response.get("content")
@@ -158,6 +180,7 @@ def call_llm(state: AgentState) -> AgentState:
             system_prompt=system_prompt,
             user_input=user_input,
             model_name=model,
+            temperature=temperature,
             messages=messages,
         )
 
@@ -183,7 +206,8 @@ def call_llm(state: AgentState) -> AgentState:
 
     except Exception as exc:
 
-        state["error"] = str(exc)
+        state["retryable"] = is_transient_overload_error(exc)
+        state["error"] = "Provider execution failed"
         state["status"] = "failed"
 
         return state
@@ -241,6 +265,10 @@ def execute_tool(state: AgentState) -> AgentState:
             continue
 
         try:
+
+            allowed_tools = state.get("allowed_tools")
+            if allowed_tools is not None and tool_name not in allowed_tools:
+                raise PermissionError("Tool is not authorized for this agent.")
 
             if isinstance(arguments, str):
 

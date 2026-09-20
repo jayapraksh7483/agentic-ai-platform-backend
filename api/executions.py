@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from core.database import get_db
+from core.security import get_current_user
  
 from models.execution import AgentExecution
  
@@ -16,9 +17,9 @@ router = APIRouter(prefix="/api/executions", tags=["Executions"])
 def list_executions(
     agent_id: Optional[str] = None,
     db: Session = Depends(get_db),
- 
+    current_user=Depends(get_current_user),
 ):
-    query = db.query(AgentExecution)
+    query = db.query(AgentExecution).filter(AgentExecution.user_id == current_user.id)
     if agent_id:
         query = query.filter(AgentExecution.agent_id == agent_id)
     return query.order_by(AgentExecution.start_time.desc()).all()
@@ -28,9 +29,12 @@ def list_executions(
 def get_execution(
     execution_id: str,
     db: Session = Depends(get_db),
-   
+    current_user=Depends(get_current_user),
 ):
-    execution = db.query(AgentExecution).filter(AgentExecution.id == execution_id).first()
+    execution = db.query(AgentExecution).filter(
+        AgentExecution.id == execution_id,
+        AgentExecution.user_id == current_user.id,
+    ).first()
     if not execution:
         raise HTTPException(status_code=404, detail="Execution not found")
     return execution

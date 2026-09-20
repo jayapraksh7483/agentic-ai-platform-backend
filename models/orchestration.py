@@ -92,6 +92,8 @@ class OrchestrationExecution(Base):
         Text,
         nullable=False,
     )
+    decision = Column(String(50), nullable=True)
+    failure_code = Column(String(80), nullable=True)
 
     # Capabilities the Manager identified for this request.
     required_capabilities = Column(
@@ -187,6 +189,7 @@ class OrchestrationStep(Base):
         String(50),
         nullable=False,
     )
+    tool_name = Column(String(150), nullable=True)
 
     # Nullable: a step can exist in a proposed plan for a capability
     # that has no matching registered agent.
